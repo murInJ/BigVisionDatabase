@@ -1,0 +1,16 @@
+#WMCA
+WMCA_root: "/mnt/win/datasets/WMCA/image/"
+WMCA_train_protocol : "/mnt/win/datasets/WMCA/yzt/P1/WMCA_Grandtest_train.txt"
+WMCA_test_protocol : "/mnt/win/datasets/WMCA/yzt/P1/WMCA_Grandtest_test.txt"
+#PADISI
+PADISI_root: "/mnt/win/datasets/USC_MULTI_SPECTRAL/image/"
+PADISI_train_protocol : "/mnt/win/datasets/USC_MULTI_SPECTRAL/USC_MutiModal_Grandtest_Protocol/train.txt"
+PADISI_test_protocol : "/mnt/win/datasets/USC_MULTI_SPECTRAL/USC_MutiModal_Grandtest_Protocol/test.txt"
+#SURF
+SURF_root: "/mnt/win/datasets/SURF/"
+SURF_train_protocol : "/mnt/win/datasets/SURF/yzt_protocol/CASIA-SURF_train.txt"
+SURF_test_protocol : "/mnt/win/datasets/SURF/yzt_protocol/CASIA-SURF_test.txt"
+#CeFA
+CeFA_root: "/mnt/win/datasets/"
+CeFA_train_protocol : "/mnt/win/datasets/CeFA/yzt/CeFA_train.txt"
+CeFA_test_protocol : "/mnt/win/datasets/CeFA/yzt/CeFA_test.txt"
