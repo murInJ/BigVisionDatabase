@@ -1,6 +1,7 @@
 # Database/db.py
 from __future__ import annotations
 
+import json
 import os
 import sys
 import traceback
@@ -253,6 +254,107 @@ class BigVisionDatabase:
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
 
+    # -------------- DB summary ---------------
+
+    def get_db_summary(self) -> Dict[str, Any]:
+        """
+        返回数据库概览汇总：
+
+        {
+          "totals": {
+            "images": <int>,             # images 表总行数
+            "relations": <int>,          # relations 表总行数
+            "protocol_rows": <int>,      # protocol 表总行数
+            "protocols": <int>           # 不同 protocol_name 的数量
+          },
+          "protocols": [
+            {
+              "protocol_name": <str>,
+              "n_relations": <int>,      # 该 protocol_name 下关联的去重 relation_id 数
+              "datasets": [<str>, ...],  # 该 protocol 覆盖到的 images.dataset_name 去重集合（按字母序）
+            },
+            ...
+          ]
+        }
+        """
+        # 1) 顶部 totals
+        totals = {}
+        totals["images"] = self.conn.execute("SELECT COUNT(*) FROM images").fetchone()[0]
+        totals["relations"] = self.conn.execute("SELECT COUNT(*) FROM relations").fetchone()[0]
+        totals["protocol_rows"] = self.conn.execute("SELECT COUNT(*) FROM protocol").fetchone()[0]
+        totals["protocols"] = self.conn.execute("SELECT COUNT(DISTINCT protocol_name) FROM protocol").fetchone()[0]
+
+        # 2) 若没有任何 protocol 行，直接返回
+        proto_rows = self.conn.execute("SELECT protocol_name, relation_id FROM protocol").fetchall()
+        if not proto_rows:
+            return {"totals": totals, "protocols": []}
+
+        # 3) protocol_name -> set(relation_id)
+        from collections import defaultdict
+        proto_to_relids: Dict[str, set] = defaultdict(set)
+        for pname, rid in proto_rows:
+            proto_to_relids[str(pname)].add(str(rid))
+
+        # 4) 拉取 relations.payload 中的 image_ids（一次或分块）
+        def _chunks(seq, n=1000):
+            it = list(seq)
+            for i in range(0, len(it), n):
+                yield it[i:i+n]
+
+        all_relids = set().union(*proto_to_relids.values())
+        relid_to_imgids: Dict[str, List[str]] = {}
+        if all_relids:
+            for chunk in _chunks(list(all_relids), 1000):
+                placeholders = ",".join(["?"] * len(chunk))
+                rows = self.conn.execute(
+                    f"SELECT relation_id, payload FROM relations WHERE relation_id IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                import json as _json
+                for rid, payload in rows:
+                    try:
+                        js = _json.loads(payload)
+                        img_ids = js.get("image_ids", []) or []
+                        relid_to_imgids[str(rid)] = [str(x) for x in img_ids]
+                    except Exception:
+                        relid_to_imgids[str(rid)] = []
+
+        # 5) 汇总所有 image_id 并查询其 dataset_name
+        all_img_ids = set()
+        for rids in proto_to_relids.values():
+            for rid in rids:
+                all_img_ids.update(relid_to_imgids.get(rid, []))
+
+        imgid_to_ds: Dict[str, str] = {}
+        if all_img_ids:
+            for chunk in _chunks(list(all_img_ids), 1000):
+                placeholders = ",".join(["?"] * len(chunk))
+                rows = self.conn.execute(
+                    f"SELECT image_id, dataset_name FROM images WHERE image_id IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                for iid, ds in rows:
+                    imgid_to_ds[str(iid)] = str(ds)
+
+        # 6) 逐 protocol 汇总：n_relations & datasets
+        out_list: List[Dict[str, Any]] = []
+        for pname in sorted(proto_to_relids.keys()):
+            relids = proto_to_relids[pname]
+            used_ds = set()
+            for rid in relids:
+                for iid in relid_to_imgids.get(rid, []):
+                    ds = imgid_to_ds.get(iid)
+                    if ds:
+                        used_ds.add(ds)
+            out_list.append({
+                "protocol_name": pname,
+                "n_relations": len(relids),
+                "datasets": sorted(used_ds),
+            })
+
+        return {"totals": totals, "protocols": out_list}
+
+
 
 # ---------------- 直接可运行：无需传参 ----------------
 if __name__ == "__main__":
@@ -279,12 +381,16 @@ if __name__ == "__main__":
             threads=0,               # 让 DuckDB 自己决定
         )
         # 默认执行：从注册器写入
-        db.ingest_from_registry(dry_run=False, show_progress=True)
-        print("[OK] registry ingestion finished.")
+        # db.ingest_from_registry(dry_run=False, show_progress=True)
+        # print("[OK] registry ingestion finished.")
 
         # 可选：立刻做一次 GC（只报告，不删除），你可以根据需要删掉下面两行
-        gc_summary = db.garbage_collect(remove_orphan_files=False, check_db_missing_files=True, verbose=True)
-        print(f"[OK] GC summary: {gc_summary}")
+        # gc_summary = db.garbage_collect(remove_orphan_files=False, check_db_missing_files=True, verbose=True)
+        # print(f"[OK] GC summary: {gc_summary}")
+
+        summary = db.get_db_summary()
+        print("[OK] DB Summary:")
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
 
     except Exception as e:
         print(f"[ERROR] ingestion failed: {e}", file=sys.stderr)
