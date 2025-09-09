@@ -354,6 +354,225 @@ class BigVisionDatabase:
 
         return {"totals": totals, "protocols": out_list}
 
+    # ------------- images methods -------------
+
+    def export_images_by_ids(
+            self,
+            image_ids: List[str],
+            out_dir: Optional[str] = None,
+            *,
+            output: str = "png",  # 'png' | 'npy' | 'both'
+            normalize: bool = True,  # PNG 导出是否 0-255 归一化
+            zip_output: bool = False,  # 是否 zip 打包
+            zip_path: Optional[str] = None,  # 自定义 zip 输出路径
+            overwrite: bool = True,
+            sample_limit: int = 20,
+            color_order: str = "bgr",  # 默认强制按 BGR 处理三通道（避免“蓝脸”）
+    ) -> Dict[str, Any]:
+        """
+        根据一组 image_id 导出图像（PNG/NPY），并可选 zip 打包。
+        默认将三通道图像视为 **BGR 来源**（OpenCV 常见读法），从而避免“把 BGR 当 RGB 写”的蓝脸问题。
+        如你的数据确认为 RGB，可显式传 color_order="rgb"。
+        """
+        import time
+        import uuid as _uuid
+        import shutil
+        from pathlib import Path
+        import numpy as _np
+
+        if output not in ("png", "npy", "both"):
+            raise ValueError("output must be one of: 'png' | 'npy' | 'both'")
+        if color_order not in ("rgb", "bgr"):
+            raise ValueError("color_order must be 'rgb' | 'bgr'")
+
+        root = Path(self.database_root)
+        if out_dir is None:
+            tmp_dir = root / "tmp" / "exports"
+            tmp_dir.mkdir(parents=True, exist_ok=True)
+            out_dir_path = tmp_dir / (time.strftime("%Y%m%d-%H%M%S") + "-" + _uuid.uuid4().hex[:6])
+        else:
+            out_dir_path = Path(out_dir)
+        out_dir_path.mkdir(parents=True, exist_ok=True)
+
+        # 查询 images 表
+        def _fetch_rows(ids: List[str]) -> Dict[str, Dict[str, Any]]:
+            if not ids:
+                return {}
+            rows: Dict[str, Dict[str, Any]] = {}
+            chunk_size = 1000
+            for i in range(0, len(ids), chunk_size):
+                chunk = ids[i:i + chunk_size]
+                placeholders = ",".join(["?"] * len(chunk))
+                q = f"""
+                SELECT image_id, uri, alias, dataset_name, modality
+                FROM images
+                WHERE image_id IN ({placeholders})
+                """
+                for image_id, uri, alias, dataset_name, modality in self.conn.execute(q, chunk).fetchall():
+                    rows[str(image_id)] = {
+                        "uri": str(uri),
+                        "alias": None if alias is None else str(alias),
+                        "dataset_name": str(dataset_name),
+                        "modality": None if modality is None else str(modality),
+                    }
+            return rows
+
+        id2row = _fetch_rows(image_ids)
+        missing = [iid for iid in image_ids if iid not in id2row]
+
+        # 数组 -> 适合写 PNG 的 uint8（保持 HxW 或 HxWxC）
+        def _prep_uint8(arr: _np.ndarray) -> _np.ndarray:
+            a = _np.asarray(arr)
+            # 尝试把 (C,H,W) 变为 (H,W,C)
+            if a.ndim == 3 and a.shape[0] in (1, 3) and a.shape[2] not in (1, 3):
+                a = _np.moveaxis(a, 0, 2)
+            while a.ndim > 3:
+                a = a.squeeze(axis=0)
+            if a.dtype == _np.uint8 and not normalize:
+                pass
+            else:
+                a = a.astype(_np.float32)
+                amin, amax = _np.nanmin(a), _np.nanmax(a)
+                if amax > amin:
+                    a = (a - amin) / (amax - amin)
+                else:
+                    a = _np.zeros_like(a, dtype=_np.float32)
+                a = (a * 255.0).round().clip(0, 255).astype(_np.uint8)
+            # 统一成 HxW 或 HxWx3
+            if a.ndim == 2:
+                return a
+            if a.ndim == 3:
+                if a.shape[2] == 1:
+                    return a[:, :, 0]
+                if a.shape[2] >= 3:
+                    return a[:, :, :3]
+            # 其他奇怪形状 → 灰度回退
+            return a.reshape(a.shape[0], a.shape[1]).astype(_np.uint8)
+
+        # 写 PNG：优先 imageio，回退 cv2
+        try:
+            import imageio.v3 as iio  # type: ignore
+            def _save_png(dst: Path, img: _np.ndarray) -> bool:
+                iio.imwrite(str(dst), img)
+                return True
+
+            writer_backend = "imageio"  # 期望 RGB
+        except Exception:
+            try:
+                import cv2  # type: ignore
+                def _save_png(dst: Path, img: _np.ndarray) -> bool:
+                    return bool(cv2.imwrite(str(dst), img))
+
+                writer_backend = "cv2"  # 期望 BGR
+            except Exception:
+                raise RuntimeError("Neither imageio nor OpenCV is available to write PNG files.")
+
+        exported_files: List[Path] = []
+        seen_names: set[str] = set()
+
+        def _safe_name(base: str, ext: str) -> str:
+            name = "".join(ch for ch in base if ch.isalnum() or ch in ("-", "_", ".", "+"))
+            if not name:
+                name = "image"
+            candidate = f"{name}.{ext}"
+            if overwrite or candidate not in seen_names:
+                seen_names.add(candidate)
+                return candidate
+            k = 1
+            while True:
+                candidate = f"{name}_{k}.{ext}"
+                if candidate not in seen_names:
+                    seen_names.add(candidate)
+                    return candidate
+                k += 1
+
+        # 主循环（保持输入顺序）
+        for idx, iid in enumerate(image_ids):
+            row = id2row.get(iid)
+            if row is None:
+                continue
+
+            src_path = (root / row["uri"]).resolve()
+            alias = row["alias"] or row["modality"] or iid
+            base = f"{idx:04d}_{alias}"
+
+            # PNG
+            if output in ("png", "both"):
+                try:
+                    arr = _np.load(src_path, allow_pickle=False)
+                    img = _prep_uint8(arr)
+
+                    # 若是三通道：默认按 BGR 来源修正到目标写入后端的期望
+                    if isinstance(img, _np.ndarray) and img.ndim == 3 and img.shape[2] == 3:
+                        if writer_backend == "imageio" and color_order == "bgr":
+                            # imageio 期望 RGB，我们的来源是 BGR -> 交换
+                            img = img[:, :, ::-1]
+                        elif writer_backend == "cv2" and color_order == "rgb":
+                            # cv2 期望 BGR，我们的来源是 RGB -> 交换
+                            img = img[:, :, ::-1]
+
+                    dst_name = _safe_name(base, "png")
+                    dst_path = out_dir_path / dst_name
+                    if dst_path.exists() and not overwrite:
+                        pass
+                    else:
+                        _save_png(dst_path, img)
+                        exported_files.append(dst_path)
+                except Exception as e:
+                    print(f"[WARN] PNG export failed for image_id={iid}: {e}", file=sys.stderr)
+
+            # NPY
+            if output in ("npy", "both"):
+                try:
+                    dst_name = _safe_name(base, "npy")
+                    dst_path = out_dir_path / dst_name
+                    if dst_path.exists() and not overwrite:
+                        pass
+                    else:
+                        shutil.copy2(src_path, dst_path)
+                        exported_files.append(dst_path)
+                except Exception as e:
+                    print(f"[WARN] NPY copy failed for image_id={iid}: {e}", file=sys.stderr)
+
+        # ZIP（可选）
+        out_zip: Optional[Path] = None
+        if zip_output:
+            import shutil
+            if zip_path:
+                zp = Path(zip_path)
+                if zp.suffix.lower() != ".zip":
+                    zp.parent.mkdir(parents=True, exist_ok=True)
+                    base, _ = os.path.splitext(str(zp))
+                    out_zip = Path(shutil.make_archive(base, "zip", root_dir=str(out_dir_path)))
+                else:
+                    tmp_base = out_dir_path.with_suffix("")
+                    tmp_zip = Path(shutil.make_archive(str(tmp_base), "zip", root_dir=str(out_dir_path)))
+                    zp.parent.mkdir(parents=True, exist_ok=True)
+                    out_zip = zp
+                    if out_zip.exists():
+                        if overwrite:
+                            out_zip.unlink()
+                        else:
+                            k = 1
+                            while True:
+                                cand = out_zip.with_name(out_zip.stem + f"_{k}").with_suffix(".zip")
+                                if not cand.exists():
+                                    out_zip = cand
+                                    break
+                    tmp_zip.replace(out_zip)
+            else:
+                base = str(out_dir_path)
+                out_zip = Path(shutil.make_archive(base, "zip", root_dir=str(out_dir_path)))
+
+        files_rel = [p.relative_to(out_dir_path).as_posix() for p in exported_files[:sample_limit]]
+        return {
+            "out_dir": str(out_dir_path),
+            "exported": len(exported_files),
+            "unique_images": len(image_ids) - len(missing),
+            "missing": missing,
+            "files": files_rel,
+            "zip_path": (str(out_zip) if out_zip else None),
+        }
 
 
 # ---------------- 直接可运行：无需传参 ----------------
@@ -391,6 +610,30 @@ if __name__ == "__main__":
         summary = db.get_db_summary()
         print("[OK] DB Summary:")
         print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+        sample_n = 16
+        # 从 DB 随机抽样 image_id（若 DuckDB 版本不支持 TABLESAMPLE，可用 ORDER BY random()）
+        rows = db.conn.execute(
+            "SELECT image_id FROM images ORDER BY random() LIMIT ?;",
+            [sample_n],
+        ).fetchall()
+        sample_ids = [r[0] for r in rows]
+
+        if not sample_ids:
+            print("[INFO] No images found in DB; skip export test.")
+        else:
+            export_res = db.export_images_by_ids(
+                sample_ids,
+                out_dir=None,  # 自动生成 tmp/exports/<ts>-<rand>/
+                output="png",  # 导出 PNG 供直观看图
+                normalize=True,  # 归一化到 8-bit
+                zip_output=True,  # 额外打包 zip
+                zip_path=None,  # 默认 zip 到导出目录同名
+                overwrite=True,
+                sample_limit=10,
+            )
+            print("[OK] Export test result:")
+            print(json.dumps(export_res, ensure_ascii=False, indent=2))
 
     except Exception as e:
         print(f"[ERROR] ingestion failed: {e}", file=sys.stderr)
