@@ -2,12 +2,14 @@
 from __future__ import annotations
 
 import json
-import os
+import shutil
 import sys
+import time
 import traceback
 import uuid
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
+
+import pandas as pd
 
 try:
     # 项目内导入（推荐）
@@ -20,6 +22,20 @@ try:
     from OriginDataset.writer import DatasetWriter
 except Exception:  # pragma: no cover
     from writer import DatasetWriter  # type: ignore
+
+from Database.utils import (
+    sha256_file,
+    finalize_export_zip,
+    bundle_read_json,
+    bundle_iter_jsonl,
+    bundle_member_exists,
+    bundle_copy_or_link_member,
+    is_zip_path,
+    render_readme_bundle,
+    export_thumbnails_for_ids,
+)
+import os
+from pathlib import Path
 
 
 class BigVisionDatabase:
@@ -839,7 +855,6 @@ class BigVisionDatabase:
     ) -> Dict[str, Any]:
         import time
         import uuid as _uuid
-        import shutil
         from pathlib import Path
         import numpy as _np
 
@@ -1035,6 +1050,736 @@ class BigVisionDatabase:
         found = [rid for rid in relation_ids if rid in found_set]
         missing = [rid for rid in relation_ids if rid not in found_set]
         return (missing, found)
+
+        # ============ EXPORT: Bundle（完整备份，可回导） ============
+
+    def export_protocol_bundle(
+            self,
+            protocol_name: str,
+            out_path: str,
+            *,
+            copy_mode: str = "copy",  # 'copy' | 'hardlink' | 'symlink' | 'manifest-only'
+            include_thumbnails: bool = False,
+            color_order: str = "bgr",
+            zip_output: bool = True,
+            overwrite: bool = False,
+    ) -> Dict[str, Any]:
+        import os
+        import time
+        import shutil
+        import json as _json
+        from pathlib import Path
+        import numpy as _np
+
+        # --- NEW: 进度条可用性 ---
+        try:
+            from tqdm import tqdm  # type: ignore
+        except Exception:
+            tqdm = None  # type: ignore
+
+        if copy_mode not in ("copy", "hardlink", "symlink", "manifest-only"):
+            raise ValueError("copy_mode must be one of: copy|hardlink|symlink|manifest-only")
+
+        root = Path(self.database_root)
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        tmp_root = root / "tmp" / f"bundle_{protocol_name}_{ts}"
+        tmp_root.mkdir(parents=True, exist_ok=True)
+
+        bundle_dir = tmp_root / f"{protocol_name}.bvbundle"
+        (bundle_dir / "images").mkdir(parents=True, exist_ok=True)
+
+        # -------- 1) relations 抽取 --------
+        rel_rows = self.conn.execute(
+            """
+            SELECT r.relation_id, r.payload
+            FROM protocol p
+            JOIN relations r ON p.relation_id = r.relation_id
+            WHERE p.protocol_name = ?
+            """,
+            [protocol_name],
+        ).fetchall()
+
+        if not rel_rows:
+            avail = [r[0] for r in
+                     self.conn.execute("SELECT DISTINCT protocol_name FROM protocol ORDER BY 1").fetchall()]
+            raise ValueError(f"No relations found for protocol '{protocol_name}'. Available protocols: {avail}")
+
+        relation_ids, all_img_ids = [], set()
+        rel_jsonl = bundle_dir / "relations.jsonl"
+        with rel_jsonl.open("w", encoding="utf-8") as f:
+            for rid, payload in rel_rows:
+                relation_ids.append(str(rid))
+                obj = _json.loads(payload) if isinstance(payload, str) else (payload or {})
+                img_ids = list(map(str, obj.get("image_ids", []) or []))
+                all_img_ids.update(img_ids)
+                f.write(_json.dumps({"relation_id": str(rid), "payload": obj}, ensure_ascii=False) + "\n")
+
+        (bundle_dir / "protocol.json").write_text(_json.dumps({
+            "protocol_name": protocol_name,
+            "relation_ids": relation_ids,
+            "counts": {"relations": len(relation_ids)}
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        # -------- 2) images_index + 拷贝/链接（带进度条） --------
+        id_list = list(all_img_ids)
+        id_meta: Dict[str, Dict[str, Any]] = {}
+
+        # 分块查 images 元信息
+        for i in range(0, len(id_list), 1000):
+            chunk = id_list[i:i + 1000]
+            placeholders = ",".join(["?"] * len(chunk))
+            q = f"""
+            SELECT image_id, uri, dataset_name, modality, alias, extra
+            FROM images
+            WHERE image_id IN ({placeholders})
+            """
+            for iid, uri, ds, mod, alias, extra in self.conn.execute(q, chunk).fetchall():
+                # 统一 extra 为对象
+                if isinstance(extra, str):
+                    try:
+                        extra_obj = _json.loads(extra)
+                    except Exception:
+                        extra_obj = {"_raw": extra}
+                elif isinstance(extra, dict):
+                    extra_obj = extra
+                else:
+                    extra_obj = {}
+                id_meta[str(iid)] = dict(
+                    uri=str(uri),
+                    dataset_name=str(ds),
+                    modality=None if mod is None else str(mod),
+                    alias=None if alias is None else str(alias),
+                    extra=extra_obj,
+                )
+
+        img_index = bundle_dir / "images_index.jsonl"
+        copied, linked, skipped, failed = 0, 0, 0, 0
+
+        # --- NEW: 单条进度条，按图片数统计 ---
+        pbar = None
+        if tqdm is not None and len(id_meta) > 0:
+            pbar = tqdm(total=len(id_meta), desc=f"bundle:{protocol_name}", unit="img", dynamic_ncols=True)
+
+        try:
+            with img_index.open("w", encoding="utf-8") as f:
+                for iid, meta in id_meta.items():
+                    src = (root / meta["uri"]).resolve()
+                    rel_dst = Path("images") / meta["dataset_name"] / f"{iid}.npy"
+                    abs_dst = (bundle_dir / rel_dst)
+                    abs_dst.parent.mkdir(parents=True, exist_ok=True)
+
+                    # 拷贝/链接（manifest-only 不拷贝）
+                    if copy_mode != "manifest-only":
+                        try:
+                            if not abs_dst.exists():
+                                if copy_mode == "copy":
+                                    shutil.copy2(src, abs_dst)
+                                    copied += 1
+                                elif copy_mode == "hardlink":
+                                    os.link(src, abs_dst)
+                                    linked += 1
+                                elif copy_mode == "symlink":
+                                    rel = os.path.relpath(src, start=abs_dst.parent)
+                                    os.symlink(rel, abs_dst)
+                                    linked += 1
+                            else:
+                                skipped += 1
+                        except Exception:
+                            failed += 1
+
+                    # 轻载 dtype/shape（即便拷贝失败也尽量记录）
+                    dtype, shape = None, None
+                    try:
+                        arr = _np.load(src, allow_pickle=False, mmap_mode="r")
+                        dtype = str(arr.dtype)
+                        shape = list(arr.shape)
+                    except Exception:
+                        pass
+
+                    f.write(_json.dumps({
+                        "image_id": iid,
+                        "rel_path": rel_dst.as_posix(),
+                        "dataset_name": meta["dataset_name"],
+                        "modality": meta["modality"],
+                        "alias": meta["alias"],
+                        "dtype": dtype,
+                        "shape": shape,
+                        "checksum_sha256": sha256_file(src),
+                        "extra": meta["extra"],
+                    }, ensure_ascii=False) + "\n")
+
+                    # --- NEW: 更新进度条 & postfix ---
+                    if pbar is not None:
+                        pbar.update(1)
+                        pbar.set_postfix(copied=copied, linked=linked, skipped=skipped, failed=failed, refresh=False)
+        finally:
+            if pbar is not None:
+                pbar.close()
+
+        # -------- 3) 缩略图（可选） --------
+        if include_thumbnails:
+            thumbs_dir = bundle_dir / "thumbnails"
+            thumbs_dir.mkdir(parents=True, exist_ok=True)
+            # 这里缩略图不再单独起进度条，避免多条刷屏；数量大时可再加
+            export_thumbnails_for_ids(
+                conn=self.conn,
+                database_root=self.database_root,
+                image_ids=id_list,
+                out_dir=thumbs_dir,
+                color_order=color_order,
+                max_side=256,
+                root_override=None,
+            )
+
+        # -------- 4) manifest + README --------
+        checksums = {
+            "relations.jsonl": f"sha256:{sha256_file(rel_jsonl)}",
+            "protocol.json": f"sha256:{sha256_file(bundle_dir / 'protocol.json')}",
+            "images_index.jsonl": f"sha256:{sha256_file(img_index)}",
+        }
+        manifest = {
+            "schema": "bvbundle.v1",
+            "protocol_name": protocol_name,
+            "created_at": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+            "exporter": "BigVisionDatabase.export_protocol_bundle",
+            "export_options": {
+                "copy_mode": copy_mode,
+                "include_thumbnails": include_thumbnails,
+                "color_order": color_order,
+            },
+            "counts": {
+                "images": len(id_list),
+                "relations": len(relation_ids),
+                "copied": copied,
+                "linked": linked,
+                "skipped": skipped,
+                "copy_failed": failed,
+            },
+            "checksums": checksums,
+        }
+        (bundle_dir / "manifest.json").write_text(_json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+        (bundle_dir / "README.md").write_text(render_readme_bundle(protocol_name), encoding="utf-8")
+
+        # -------- 5) 打包/落盘 --------
+        return finalize_export_zip(bundle_dir, out_path, zip_output, overwrite)
+
+    def verify_bundle(
+            self,
+            bundle_path: str,
+            *,
+            strict: bool = True,
+            check_sha256: bool = True,
+            sample_limit: int = 20,
+    ) -> Dict[str, Any]:
+
+
+        p = Path(bundle_path)
+        # 1) 结构文件
+        required = ["manifest.json", "protocol.json", "relations.jsonl", "images_index.jsonl"]
+        for name in required:
+            if not bundle_member_exists(p, name):
+                msg = f"missing required file: {name}"
+                if strict: raise RuntimeError(msg)
+                return {"ok": False, "error": msg}
+
+        # 2) 校验 checksums
+        manifest = bundle_read_json(p, "manifest.json")
+        checksums = (manifest.get("checksums") or {}) if isinstance(manifest, dict) else {}
+        if check_sha256 and checksums:
+            # 只能对目录情形直接读文件哈希；ZIP 的哈希已随包固定（可跳过或扩展：计算 zip 成员哈希）
+            if not is_zip_path(p):
+                for name, val in checksums.items():
+                    alg, hexd = val.split(":", 1)
+                    if alg != "sha256":
+                        msg = f"unsupported checksum alg: {alg}"
+                        if strict: raise RuntimeError(msg)
+                        return {"ok": False, "error": msg}
+                    real = sha256_file((Path(p) / name))
+                    if real != hexd:
+                        msg = f"checksum mismatch for {name}: expect {hexd}, got {real}"
+                        if strict: raise RuntimeError(msg)
+                        return {"ok": False, "error": msg}
+
+        # 3) index 覆盖 relations 引用
+        idx_map: Dict[str, str] = {}
+        for o in bundle_iter_jsonl(p, "images_index.jsonl"):
+            if "image_id" in o and "rel_path" in o:
+                idx_map[str(o["image_id"])] = str(o["rel_path"])
+        miss_img_ids = []
+        for o in bundle_iter_jsonl(p, "relations.jsonl"):
+            payload = o.get("payload") or {}
+            for iid in (payload.get("image_ids") or []):
+                if str(iid) not in idx_map:
+                    miss_img_ids.append(str(iid))
+                    if len(miss_img_ids) >= sample_limit:
+                        break
+            if miss_img_ids:
+                break
+        if miss_img_ids:
+            msg = f"relations reference missing images in index; sample: {miss_img_ids[:sample_limit]}"
+            if strict: raise RuntimeError(msg)
+            return {"ok": False, "error": msg}
+
+        # 4) 文件存在性（对目录或 zip 解压后的逐文件检查，这里对 zip 仅检查元信息是否存在即可）
+        missing_files = []
+        if not is_zip_path(p):
+            for iid, relp in list(idx_map.items())[: max(10000, sample_limit)]:
+                fp = Path(p) / relp
+                if not fp.exists():
+                    missing_files.append(relp)
+
+        return {
+            "ok": len(missing_files) == 0,
+            "missing_files": missing_files[:sample_limit],
+            "index_size": len(idx_map),
+        }
+
+        # ============ IMPORT: Bundle（加载回 DB） ============
+
+    def load_bundle(
+        self,
+        bundle_path: str,
+        *,
+        mode: str = "strict",           # 'strict' | 'overwrite' | 'skip-existing'
+        copy_mode: str = "copy",        # 'copy'|'hardlink'|'symlink'（ZIP 会自动退化为 copy）
+        verify: bool = True,
+        verify_checksums: bool = True,
+        batch_size: int = 2000,
+        verbose: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        将 Bundle（目录或 .zip）加载回 DB：
+          - 逐文件拷贝/链接图片到 <db_root>/images/<dataset>/<image_id>.npy（ZIP 按需流式复制，不整包解压）
+          - 批量插入/更新 images、relations、protocol 三表
+
+        mode:
+          - strict       : 任意 image_id / relation_id 冲突都会报错并中止
+          - overwrite    : 覆盖 DB 内容（images/relations/protocol），文件会被替换
+          - skip-existing: 已存在的行/文件跳过，仅插入缺失项
+
+        batch_size: 分批插入大小（越大越快、占用内存越高）
+        verbose   : 显示进度（需要安装 tqdm；若缺失则自动安静模式）
+        """
+        import json
+        from pathlib import Path
+
+        if mode not in ("strict", "overwrite", "skip-existing"):
+            raise ValueError("mode must be 'strict'|'overwrite'|'skip-existing'")
+        if copy_mode not in ("copy", "hardlink", "symlink"):
+            raise ValueError("copy_mode must be 'copy'|'hardlink'|'symlink'")
+
+        # 可选进度条
+        try:
+            from tqdm import tqdm  # type: ignore
+        except Exception:
+            tqdm = None
+            verbose = False
+
+        # 0) 验证
+        if verify:
+            ver = self.verify_bundle(bundle_path, strict=True, check_sha256=verify_checksums)
+            if not ver.get("ok", True):
+                raise RuntimeError(f"verify_bundle failed: {ver}")
+
+        # 1) protocol
+        proto = bundle_read_json(bundle_path, "protocol.json")
+        protocol_name = str(proto.get("protocol_name", "unknown"))
+
+        root = Path(self.database_root)
+        images_processed = 0
+        relations_processed = 0
+        proto_links = 0
+
+        # -------- 统计条目数（仅用于进度条 total） --------
+        def _count_jsonl(member: str) -> int:
+            c = 0
+            for _ in bundle_iter_jsonl(bundle_path, member):
+                c += 1
+            return c
+
+        total_images = _count_jsonl("images_index.jsonl") if verbose and tqdm else None
+        total_rel    = _count_jsonl("relations.jsonl")     if verbose and tqdm else None
+
+        pbar_imgs = tqdm(total=total_images, desc="load:images", unit="img", dynamic_ncols=True) if verbose and total_images is not None else None
+        pbar_rels = tqdm(total=total_rel,    desc="load:relations", unit="rel", dynamic_ncols=True) if verbose and total_rel is not None else None
+
+        # -------- 2) 处理 images（分批） --------
+        img_batch_rows: List[Dict[str, Any]] = []
+        img_batch_ids: List[str] = []
+
+        def _flush_images_batch():
+            nonlocal images_processed
+            if not img_batch_rows:
+                return
+            # 冲突检查
+            placeholders = ",".join(["?"] * len(img_batch_ids))
+            existing_ids = set(r[0] for r in self.conn.execute(
+                f"SELECT image_id FROM images WHERE image_id IN ({placeholders})",
+                img_batch_ids,
+            ).fetchall())
+            if mode == "strict" and existing_ids:
+                raise RuntimeError(f"[images] strict conflict: sample={list(existing_ids)[:10]}")
+
+            to_insert = [r for r in img_batch_rows if r["image_id"] not in existing_ids or mode == "overwrite"]
+            if to_insert:
+                import pandas as pd
+                df = pd.DataFrame(to_insert, columns=["image_id", "uri", "modality", "dataset_name", "alias", "extra"])
+                self.conn.execute("BEGIN;")
+                try:
+                    if mode == "overwrite" and existing_ids:
+                        del_ids = [r["image_id"] for r in to_insert if r["image_id"] in existing_ids]
+                        if del_ids:
+                            ph = ",".join(["?"] * len(del_ids))
+                            self.conn.execute(f"DELETE FROM images WHERE image_id IN ({ph})", del_ids)
+                    self.conn.register("img_df_tmp_import", df)
+                    self.conn.execute("INSERT INTO images SELECT * FROM img_df_tmp_import;")
+                    self.conn.execute("COMMIT;")
+                except Exception:
+                    self.conn.execute("ROLLBACK;")
+                    raise
+            images_processed += len(img_batch_rows)
+            img_batch_rows.clear()
+            img_batch_ids.clear()
+
+        # 实际逐条处理（复制文件 + 构建行）
+        for idx, o in enumerate(bundle_iter_jsonl(bundle_path, "images_index.jsonl")):
+            if not o or "image_id" not in o or "rel_path" not in o:
+                if pbar_imgs: pbar_imgs.update(1)
+                continue
+            iid = str(o["image_id"])
+            relp = str(o["rel_path"])
+            ds = str(o.get("dataset_name", "unknown"))
+            modality = o.get("modality")
+            alias = o.get("alias")
+            extra = o.get("extra")
+
+            # 拷贝/链接到 DB 标准布局
+            dst_rel = Path("images") / ds / f"{iid}.npy"
+            dst_abs = (root / dst_rel)
+            if mode in ("overwrite", "strict") or not dst_abs.exists():
+                # zip 会在 bundle_copy_or_link_member 内部自动退化为 copy
+                bundle_copy_or_link_member(bundle_path, relp, dst_abs, mode=copy_mode, overwrite=(mode != "strict"))
+
+            img_batch_rows.append({
+                "image_id": iid,
+                "uri": dst_rel.as_posix(),
+                "modality": None if modality is None else str(modality),
+                "dataset_name": ds,
+                "alias": None if alias is None else str(alias),
+                "extra": extra if isinstance(extra, str) else json.dumps(extra or {}, ensure_ascii=False, sort_keys=True),
+            })
+            img_batch_ids.append(iid)
+
+            if pbar_imgs:
+                pbar_imgs.update(1)
+
+            if len(img_batch_rows) >= batch_size:
+                _flush_images_batch()
+
+        _flush_images_batch()
+        if pbar_imgs: pbar_imgs.close()
+
+        # -------- 3) 处理 relations（分批），并在每批后立刻写 protocol 映射 --------
+        rel_batch_rows: List[Dict[str, Any]] = []
+        rel_batch_ids: List[str] = []
+
+        def _flush_rel_batch():
+            nonlocal relations_processed, proto_links
+            if not rel_batch_rows:
+                return
+            placeholders = ",".join(["?"] * len(rel_batch_ids))
+            existing_rids = set(r[0] for r in self.conn.execute(
+                f"SELECT relation_id FROM relations WHERE relation_id IN ({placeholders})",
+                rel_batch_ids,
+            ).fetchall())
+            if mode == "strict" and existing_rids:
+                raise RuntimeError(f"[relations] strict conflict: sample={list(existing_rids)[:10]}")
+
+            to_insert = [r for r in rel_batch_rows if r["relation_id"] not in existing_rids or mode == "overwrite"]
+            if to_insert:
+                import pandas as pd
+                df = pd.DataFrame(to_insert, columns=["relation_id", "payload"])
+                self.conn.execute("BEGIN;")
+                try:
+                    if mode == "overwrite" and existing_rids:
+                        del_ids = [r["relation_id"] for r in to_insert if r["relation_id"] in existing_rids]
+                        if del_ids:
+                            ph = ",".join(["?"] * len(del_ids))
+                            self.conn.execute(f"DELETE FROM relations WHERE relation_id IN ({ph})", del_ids)
+                    self.conn.register("rel_df_tmp_import", df)
+                    self.conn.execute("INSERT INTO relations SELECT * FROM rel_df_tmp_import;")
+                    self.conn.execute("COMMIT;")
+                except Exception:
+                    self.conn.execute("ROLLBACK;")
+                    raise
+
+            # protocol 映射（本批）
+            if rel_batch_ids:
+                ph = ",".join(["?"] * len(rel_batch_ids))
+                exists_map = set(r[0] for r in self.conn.execute(
+                    f"SELECT relation_id FROM protocol WHERE protocol_name = ? AND relation_id IN ({ph})",
+                    [protocol_name, *rel_batch_ids],
+                ).fetchall())
+                if mode == "strict" and exists_map:
+                    raise RuntimeError(f"[protocol] strict mapping conflict: sample={list(exists_map)[:10]}")
+                to_link = [rid for rid in rel_batch_ids if rid not in exists_map or mode == "overwrite"]
+
+                if to_link:
+                    rows = [(protocol_name, rid, protocol_name) for rid in to_link]
+                    import pandas as pd
+                    df_map = pd.DataFrame(rows, columns=["protocol_name", "relation_id", "relation_set"])
+                    self.conn.execute("BEGIN;")
+                    try:
+                        if mode == "overwrite" and exists_map:
+                            del_ids = [rid for rid in to_link if rid in exists_map]
+                            if del_ids:
+                                ph2 = ",".join(["?"] * len(del_ids))
+                                self.conn.execute(
+                                    f"DELETE FROM protocol WHERE protocol_name = ? AND relation_id IN ({ph2})",
+                                    [protocol_name, *del_ids],
+                                )
+                        self.conn.register("proto_df_tmp_import", df_map)
+                        self.conn.execute("INSERT INTO protocol SELECT * FROM proto_df_tmp_import;")
+                        self.conn.execute("COMMIT;")
+                    except Exception:
+                        self.conn.execute("ROLLBACK;")
+                        raise
+                    proto_links += len(to_link)
+
+            relations_processed += len(rel_batch_rows)
+            rel_batch_rows.clear()
+            rel_batch_ids.clear()
+
+        for idx, o in enumerate(bundle_iter_jsonl(bundle_path, "relations.jsonl")):
+            if not o or "relation_id" not in o or "payload" not in o:
+                if pbar_rels: pbar_rels.update(1)
+                continue
+            rid = str(o["relation_id"])
+            payload = o["payload"] if isinstance(o["payload"], dict) else {}
+            rel_batch_rows.append({"relation_id": rid, "payload": json.dumps(payload, ensure_ascii=False, sort_keys=True)})
+            rel_batch_ids.append(rid)
+
+            if pbar_rels:
+                pbar_rels.update(1)
+
+            if len(rel_batch_rows) >= batch_size:
+                _flush_rel_batch()
+
+        _flush_rel_batch()
+        if pbar_rels: pbar_rels.close()
+
+        if verbose:
+            print(f"[LOAD] images={images_processed}, relations={relations_processed}, protocol_links={proto_links}, mode={mode}, copy_mode={copy_mode}{' (zip->copy)' if is_zip_path(bundle_path) else ''}")
+
+        return {
+            "protocol_name": protocol_name,
+            "images_processed": int(images_processed),
+            "relations_processed": int(relations_processed),
+            "protocol_links": int(proto_links),
+            "mode": mode,
+            "copy_mode": f"{copy_mode}{' (zip->copy)' if is_zip_path(bundle_path) else ''}",
+            "batch_size": int(batch_size),
+        }
+    # -------------- compact -----------------
+    def export_protocol_compact_trainset(
+            self,
+            protocol_name: str,
+            out_path: str | None = None,
+            *,
+            zip_output: bool = True,
+            overwrite: bool = False,
+    ) -> dict:
+        """
+        导出指定 protocol 为 Compact 训练就绪数据集（分片 Parquet + 原样 NPY + loader.py + README + manifest）。
+        - 当 out_path 为 None 时，自动输出到 <database_root>/tmp/compact/<protocol>_compact_<ts>.zip（zip_output=True）
+          或者 <database_root>/tmp/compact/<protocol>_compact_<ts>/ 目录（zip_output=False）。
+        """
+        import os, time, json as _json, shutil, random
+        from pathlib import Path
+        import pandas as pd
+        from Database.utils import sha256_file, finalize_export_zip, render_readme_compact  # <<< 用utils里的函数
+
+        root = Path(self.database_root)
+
+        # --- 计算默认 out_path ---
+        if out_path is None:
+            ts = time.strftime("%Y%m%d-%H%M%S")
+            base_dir = root / "tmp" / "compact"
+            base_dir.mkdir(parents=True, exist_ok=True)
+            out_path = str(base_dir / (f"{protocol_name}_compact_{ts}.zip" if zip_output
+                                       else f"{protocol_name}_compact_{ts}"))
+
+        # --- 构建输出目录（若 zip 则用构建目录再打包） ---
+        is_zip_target = str(out_path).lower().endswith(".zip") or zip_output
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        build_root = root / "tmp" / f"compact_build_{protocol_name}_{ts}"
+        export_dir = build_root / f"{protocol_name}.compact" if is_zip_target else Path(out_path)
+
+        if export_dir.exists():
+            if not overwrite:
+                raise FileExistsError(f"Target exists: {export_dir}")
+            shutil.rmtree(export_dir, ignore_errors=True)
+        export_dir.mkdir(parents=True, exist_ok=True)
+
+        images_out = export_dir / "images"
+        samples_out = export_dir / "samples"
+        images_out.mkdir(parents=True, exist_ok=True)
+        samples_out.mkdir(parents=True, exist_ok=True)
+
+        # --- 拉取 protocol 关系 ---
+        rel_rows = self.conn.execute(
+            """
+            SELECT r.relation_id, r.payload
+            FROM protocol p
+            JOIN relations r ON p.relation_id = r.relation_id
+            WHERE p.protocol_name = ?
+            """,
+            [protocol_name],
+        ).fetchall()
+        if not rel_rows:
+            raise RuntimeError(f"No relations found for protocol '{protocol_name}'.")
+
+        # --- 收集 image_ids + 关系对象 ---
+        all_relations = []
+        all_image_ids = set()
+        for rid, payload in rel_rows:
+            obj = _json.loads(payload) if isinstance(payload, str) else (payload or {})
+            img_ids = obj.get("image_ids", []) or []
+            all_image_ids.update(map(str, img_ids))
+            all_relations.append((str(rid), obj))
+
+        # --- 批量查询 image 元数据（一次拿全：uri/dataset_name/modality/alias） ---
+        id_list = list(all_image_ids)
+        # image_id -> (uri, dataset_name, modality, alias)
+        id_to_meta: dict[str, tuple[str, str, str | None, str | None]] = {}
+        if id_list:
+            for i in range(0, len(id_list), 1000):
+                chunk = id_list[i:i + 1000]
+                ph = ",".join(["?"] * len(chunk))
+                q = f"""
+                SELECT image_id, uri, dataset_name, modality, alias
+                FROM images
+                WHERE image_id IN ({ph})
+                """
+                for iid, uri, ds, mod, alias in self.conn.execute(q, chunk).fetchall():
+                    id_to_meta[str(iid)] = (
+                        str(uri),
+                        str(ds),
+                        None if mod is None else str(mod),
+                        None if alias is None else str(alias),
+                    )
+
+        # --- 复制 NPY 到 images/<ds>/<iid>.npy ---
+        for iid in id_list:
+            meta = id_to_meta.get(iid)
+            if not meta:
+                continue
+            src_uri, ds, _mod, _alias = meta
+            src_abs = (root / src_uri).resolve()
+            dst_abs = (images_out / ds / f"{iid}.npy")
+            dst_abs.parent.mkdir(parents=True, exist_ok=True)
+            if dst_abs.exists() and not overwrite:
+                continue
+            shutil.copy2(src_abs, dst_abs)
+
+        # --- 组装 samples 行并分片写 parquet ---
+        rows = []
+        for rid, pobj in all_relations:
+            img_ids = list(map(str, pobj.get("image_ids", []) or []))
+
+            # >>>>>> 别名优先级（逐 relation） <<<<<<
+            # 1) relation.image_aliases（长度与 image_ids 一致）
+            # 2) relation.image_names（长度一致）
+            # 3) images.alias
+            # 4) images.modality
+            # 5) "img{序号}"
+            rel_aliases = None
+            if isinstance(pobj.get("image_aliases"), list) and len(pobj["image_aliases"]) == len(img_ids):
+                rel_aliases = [str(a) for a in pobj["image_aliases"]]
+            elif isinstance(pobj.get("image_names"), list) and len(pobj["image_names"]) == len(img_ids):
+                rel_aliases = [str(a) for a in pobj["image_names"]]
+
+            image_paths, image_aliases = [], []
+            for j, iid in enumerate(img_ids):
+                meta = id_to_meta.get(iid)
+                if not meta:
+                    ds = "unknown"
+                    uri_rel = f"images/{ds}/{iid}.npy"
+                    alias_val = rel_aliases[j] if rel_aliases is not None else f"img{j}"
+                else:
+                    _uri, ds, mod, alias = meta
+                    uri_rel = f"images/{ds}/{iid}.npy"
+                    if rel_aliases is not None:
+                        alias_val = rel_aliases[j]
+                    else:
+                        alias_val = alias or mod or f"img{j}"
+
+                image_paths.append(uri_rel)
+                image_aliases.append(str(alias_val))
+
+            rows.append({
+                "protocol_name": protocol_name,
+                "relation_id": rid,
+                "image_paths": image_paths,
+                "image_aliases": image_aliases,
+                "task_type": pobj.get("task_type"),
+                "annotation": _json.dumps(pobj.get("annotation", {}), ensure_ascii=False, sort_keys=True),
+                "extra": _json.dumps(pobj.get("extra", {}), ensure_ascii=False, sort_keys=True),
+            })
+
+        # 打乱行（可复现）
+        random.Random(2025).shuffle(rows)
+
+        SHARD_ROWS = 100_000
+
+        def _write_shard(idx: int, part: list[dict]):
+            df = pd.DataFrame(part, columns=[
+                "protocol_name", "relation_id",
+                "image_paths", "image_aliases",
+                "task_type", "annotation", "extra",
+            ])
+            df.to_parquet(samples_out / f"samples-{idx:05d}.parquet", index=False)
+
+        if rows:
+            for idx in range(0, len(rows), SHARD_ROWS):
+                _write_shard(idx // SHARD_ROWS, rows[idx: idx + SHARD_ROWS])
+
+        # --- 复制 loader.py ---
+        try:
+            repo_root = Path(__file__).resolve().parents[1]
+            loader_src = repo_root / "misc" / "loader.py"
+            if not loader_src.exists():
+                loader_src = Path("misc/loader.py")
+            shutil.copy2(loader_src, export_dir / "loader.py")
+        except Exception:
+            pass
+
+        # --- README：使用 utils 的渲染函数 ---
+        (export_dir / "README.md").write_text(render_readme_compact(protocol_name), encoding="utf-8")
+
+        # --- manifest（包含每个分片校验和） ---
+        checksums = {}
+        for p in sorted(samples_out.glob("samples-*.parquet")):
+            rel = p.relative_to(export_dir).as_posix()
+            checksums[rel] = f"sha256:{sha256_file(p)}"
+        manifest = {
+            "schema": "compact.v1",
+            "protocol_name": protocol_name,
+            "created_at": __import__("datetime").datetime.utcnow().isoformat() + "Z",
+            "counts": {
+                "relations": len(all_relations),
+                "images": len(id_list),
+                "parquet_shards": len(list(samples_out.glob('samples-*.parquet'))),
+            },
+            "checksums": checksums,
+        }
+        (export_dir / "manifest.json").write_text(_json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        # --- 打包或直接返回目录 ---
+        res = finalize_export_zip(export_dir, out_path, zip_output=is_zip_target, overwrite=overwrite)
+        if is_zip_target:
+            shutil.rmtree(build_root, ignore_errors=True)
+        return res
 
     # ---------------- 生命周期 ----------------
 

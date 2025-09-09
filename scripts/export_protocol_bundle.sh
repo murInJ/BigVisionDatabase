@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+Usage: scripts/export_protocol_bundle.sh -p <protocol_name> [-o <out_path>] [-m copy|hardlink|symlink|manifest-only] [-t] [-c rgb|bgr] [-Z] [-f]
+
+Options:
+  -p  protocol_name                 (必填) 要导出的协议名
+  -o  out_path                      导出路径；若以 .zip 结尾则输出 zip；否则输出目录（默认：<DB_ROOT>/bundles/<protocol>.zip）
+  -m  copy_mode                     {copy|hardlink|symlink|manifest-only}，默认 copy
+  -t                                包含缩略图（thumbnails）
+  -c  color_order                   {rgb|bgr} 生成缩略图时的通道顺序，默认 bgr
+  -Z                                不打包 zip（导出为目录）
+  -f                                覆盖已存在的目标（overwrite）
+
+Env:
+  DB_ROOT                           若未提供，将在脚本内的 Python 中尝试从 Config.setting 读取；失败时回落到 ./bigvision_db
+USAGE
+}
+
+protocol_name=""
+out_path=""
+copy_mode="copy"
+include_thumbs="0"
+color_order="bgr"
+zip_output="1"
+overwrite="0"
+
+while getopts ":p:o:m:tc:Zf" opt; do
+  case $opt in
+    p) protocol_name="$OPTARG" ;;
+    o) out_path="$OPTARG" ;;
+    m) copy_mode="$OPTARG" ;;
+    t) include_thumbs="1" ;;
+    c) color_order="$OPTARG" ;;
+    Z) zip_output="0" ;;
+    f) overwrite="1" ;;
+    *) usage; exit 2 ;;
+  esac
+done
+
+if [[ -z "${protocol_name}" ]]; then
+  usage; exit 2
+fi
+
+python3 - <<'PY' "$protocol_name" "${out_path}" "${copy_mode}" "${include_thumbs}" "${color_order}" "${zip_output}" "${overwrite}"
+import os, sys, json, pathlib
+
+# 过滤偶发的 '--'
+argv = [a for a in sys.argv[1:] if a != '--']
+if len(argv) != 7:
+    raise SystemExit(f"Expected 7 args, got {len(argv)}: {argv}")
+
+protocol_name, out_path, copy_mode, include_thumbs, color_order, zip_output, overwrite = argv
+
+# 解析 database_root
+database_root = os.environ.get("DB_ROOT")
+if not database_root:
+    try:
+        from Config.setting import GetDatabaseConfig  # type: ignore
+        cfg = GetDatabaseConfig()
+        database_root = cfg["database_root"]
+        print(f"[INFO] database_root from Config.setting: {database_root}")
+    except Exception:
+        database_root = os.path.abspath("./bigvision_db")
+        print(f"[INFO] Fallback database_root: {database_root}")
+
+# 默认 out_path
+if not out_path:
+    out_dir = pathlib.Path(database_root) / "bundles"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = str(out_dir / f"{protocol_name}.zip")
+
+include_thumbs = (include_thumbs == "1")
+zip_output = (zip_output == "1")
+overwrite = (overwrite == "1")
+
+from Database.db import BigVisionDatabase  # type: ignore
+
+db = BigVisionDatabase(database_root=database_root, duckdb_path=None, max_workers=max(8, (os.cpu_count() or 8)), threads=0)
+try:
+    res = db.export_protocol_bundle(
+        protocol_name=protocol_name,
+        out_path=out_path,
+        copy_mode=copy_mode,
+        include_thumbnails=include_thumbs,
+        color_order=color_order,
+        zip_output=zip_output,
+        overwrite=overwrite,
+    )
+    print(json.dumps({"ok": True, "result": res}, ensure_ascii=False, indent=2))
+finally:
+    db.close()
+PY
