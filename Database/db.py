@@ -32,8 +32,8 @@ class BigVisionDatabase:
       - 提供 DB 概览统计
       - 提供按 image_id 导出图像（PNG/NPY，并可 zip 打包）
       - 提供 relations 的增删查改（CRUD）
-
-    目录约定：
+      - 提供 protocol 的增删查改、拷贝/合并/重命名、采样与基于 relations 构建等
+    目录：
       <database_root>/images/<dataset_name>/<UUID>.npy
       <database_root>/db/catalog.duckdb
     """
@@ -45,25 +45,18 @@ class BigVisionDatabase:
         max_workers: int = 8,
         threads: Optional[int] = None,
     ) -> None:
-        """
-        Args:
-            database_root: DB 根目录
-            duckdb_path:   自定义 DuckDB 文件路径；默认 <database_root>/db/catalog.duckdb
-            max_workers:   写图并发
-            threads:       DuckDB PRAGMA threads（None/0 表示让 DuckDB 自行决定）
-        """
         self.database_root = database_root
         self.duckdb_path = duckdb_path or f"{database_root}/db/catalog.duckdb"
 
-        # 管理连接（单处持有）
+        # 单处持有连接
         self.conn = require_duckdb(
             duckdb_path=self.duckdb_path,
             threads=(threads or 0),
         )
-        # 初始化 schema（集中在 DB 层）
+        # DB 层统一建表
         init_duckdb_schema(self.conn)
 
-        # 注入连接到 writer（writer 不再管理连接与 schema）
+        # writer 专注写入
         self.writer = DatasetWriter(
             conn=self.conn,
             database_root=database_root,
@@ -80,10 +73,6 @@ class BigVisionDatabase:
         protocols: Dict[str, List[str]],
         dry_run: bool = False,
     ) -> Dict[str, int]:
-        """
-        写入单条样本（一个 adaptor item）。
-        返回计数字典：{'imgs': X, 'rels': Y, 'proto': Z}
-        """
         return self.writer.write_dataset(
             images=images,
             relations=relations,
@@ -97,10 +86,6 @@ class BigVisionDatabase:
         *,
         dry_run: bool = False,
     ) -> Dict[str, int]:
-        """
-        从一个 adaptor 实例顺序写入（不显示进度；可由上层包 tqdm）。
-        返回聚合计数 {'imgs': X, 'rels': Y, 'proto': Z, 'err': E}
-        """
         agg = {"imgs": 0, "rels": 0, "proto": 0, "err": 0}
         for _idx, data in enumerate(adaptor):
             try:
@@ -123,9 +108,6 @@ class BigVisionDatabase:
         dry_run: bool = False,
         show_progress: bool = True,
     ) -> None:
-        """
-        扫描注册器批量写入（每个 adaptor 一个进度条，逻辑在 writer 内）。
-        """
         self.writer.write_from_registry(dry_run=dry_run, show_progress=show_progress)
 
     # ---------------- 垃圾回收 ----------------
@@ -138,35 +120,23 @@ class BigVisionDatabase:
         report_limit: int = 20,
         verbose: bool = False,
     ) -> Dict[str, Any]:
-        """
-        清理/报告不一致数据（幂等、只针对“单机本地路径”）：
-        1) 孤儿文件（磁盘存在但 DB 无引用或路径不一致）
-        2) DB 缺失文件（DB 行指向的文件在磁盘上不存在）
-        """
         root = Path(self.database_root)
         images_root = root / "images"
 
-        # --- 构建 DB 快照（image_id -> uri） ---
         db_rows = self.conn.execute("SELECT image_id, uri FROM images").fetchall()
         db_images_count = len(db_rows)
         id2uri: Dict[str, str] = {r[0]: r[1] for r in db_rows}
         db_ids: Set[str] = set(id2uri.keys())
 
-        # --- 扫描磁盘 ---
         files_scanned = 0
         orphan_paths: List[Path] = []
         for p in images_root.rglob("*.npy"):
             files_scanned += 1
-            stem = p.stem  # UUID 作为 image_id
-            rel_uri = p.relative_to(root).as_posix()  # "images/<dataset>/<uuid>.npy"
-
-            if stem not in db_ids:
+            stem = p.stem
+            rel_uri = p.relative_to(root).as_posix()
+            if stem not in db_ids or id2uri.get(stem) != rel_uri:
                 orphan_paths.append(p)
-            else:
-                if id2uri.get(stem) != rel_uri:
-                    orphan_paths.append(p)
 
-        # --- 可选：删除孤儿文件 ---
         orphan_removed = 0
         orphan_samples: List[str] = []
         if orphan_paths:
@@ -186,7 +156,6 @@ class BigVisionDatabase:
                         except Exception:
                             pass
 
-        # --- 可选：检查 DB 行对应的文件是否缺失 ---
         missing_file_rows = 0
         missing_samples: List[Tuple[str, str]] = []
         if check_db_missing_files:
@@ -215,9 +184,6 @@ class BigVisionDatabase:
     # ---------------- 概览统计 ----------------
 
     def get_db_summary(self) -> Dict[str, Any]:
-        """
-        返回数据库概览汇总（总数 + 按 protocol 汇总数据集覆盖）。
-        """
         totals = {}
         totals["images"] = self.conn.execute("SELECT COUNT(*) FROM images").fetchone()[0]
         totals["relations"] = self.conn.execute("SELECT COUNT(*) FROM relations").fetchone()[0]
@@ -233,7 +199,6 @@ class BigVisionDatabase:
         for pname, rid in proto_rows:
             proto_to_relids[str(pname)].add(str(rid))
 
-        # 批量拉取 relations.payload
         def _chunks(seq, n=1000):
             it = list(seq)
             for i in range(0, len(it), n):
@@ -256,7 +221,6 @@ class BigVisionDatabase:
                     except Exception:
                         relid_to_imgids[str(rid)] = []
 
-        # 查询 images.dataset_name
         all_img_ids = set()
         for rids in proto_to_relids.values():
             for rid in rids:
@@ -299,17 +263,12 @@ class BigVisionDatabase:
         protocols: Optional[List[str]] = None,
         dry_run: bool = False,
     ) -> Dict[str, Any]:
-        """
-        新增一条 relation。payload 必须包含 image_ids(list)。
-        协议列表 protocols（可为空）会将该 relation 归入多个 protocol（relation_set=protocol_name）。
-        """
         if not isinstance(payload, dict):
             raise ValueError("payload must be a dict")
         image_ids = payload.get("image_ids") or []
         if not isinstance(image_ids, list):
             raise ValueError("payload['image_ids'] must be a list")
 
-        # 校验 image_ids 是否存在（仅报告）
         missing = []
         if image_ids:
             placeholders = ",".join(["?"] * len(image_ids))
@@ -353,9 +312,6 @@ class BigVisionDatabase:
         }
 
     def get_relation(self, relation_id: str) -> Optional[Dict[str, Any]]:
-        """
-        读取单条 relation：返回 {relation_id, payload(dict), protocols:[...]} 或 None
-        """
         row = self.conn.execute(
             "SELECT payload FROM relations WHERE relation_id = ?",
             [relation_id],
@@ -373,15 +329,11 @@ class BigVisionDatabase:
         self,
         relation_id: str,
         *,
-        payload: Optional[Dict[str, Any]] = None,           # 若提供则全量替换 payload
-        add_protocols: Optional[List[str]] = None,          # 需要新增归属的协议名
-        remove_protocols: Optional[List[str]] = None,       # 需要移除归属的协议名
+        payload: Optional[Dict[str, Any]] = None,
+        add_protocols: Optional[List[str]] = None,
+        remove_protocols: Optional[List[str]] = None,
         dry_run: bool = False,
     ) -> Dict[str, Any]:
-        """
-        更新 relation：可替换 payload、增删协议归属。
-        """
-        # 是否存在
         exists = self.conn.execute(
             "SELECT COUNT(*) FROM relations WHERE relation_id = ?",
             [relation_id],
@@ -389,7 +341,6 @@ class BigVisionDatabase:
         if not exists:
             return {"relation_id": relation_id, "updated": False, "error": "relation not found"}
 
-        # 检查 payload 合法性（如包含 image_ids 则校验）
         missing = []
         if payload is not None:
             img_ids = payload.get("image_ids") if isinstance(payload, dict) else None
@@ -422,16 +373,13 @@ class BigVisionDatabase:
                     "UPDATE relations SET payload = ? WHERE relation_id = ?",
                     [payload_json, relation_id],
                 )
-            # 删除协议
             if remove_protocols:
                 placeholders = ",".join(["?"] * len(remove_protocols))
                 self.conn.execute(
                     f"DELETE FROM protocol WHERE relation_id = ? AND protocol_name IN ({placeholders})",
                     [relation_id, *remove_protocols],
                 )
-            # 新增协议（去重）
             if add_protocols:
-                # 先查已有
                 existing = {r[0] for r in self.conn.execute(
                     "SELECT protocol_name FROM protocol WHERE relation_id = ?",
                     [relation_id],
@@ -441,7 +389,6 @@ class BigVisionDatabase:
                     rows = [(p, relation_id, p) for p in to_add]
                     self.conn.register("proto_df_tmp2", self._rows_to_df(rows, ["protocol_name", "relation_id", "relation_set"]))
                     self.conn.execute("INSERT INTO protocol SELECT * FROM proto_df_tmp2;")
-
             self.conn.execute("COMMIT;")
         except Exception:
             self.conn.execute("ROLLBACK;")
@@ -462,9 +409,6 @@ class BigVisionDatabase:
         *,
         dry_run: bool = False,
     ) -> Dict[str, Any]:
-        """
-        删除 relation（及其在 protocol 中的引用）。不删除 images。
-        """
         exists = self.conn.execute(
             "SELECT COUNT(*) FROM relations WHERE relation_id = ?",
             [relation_id],
@@ -496,9 +440,6 @@ class BigVisionDatabase:
         limit: int = 100,
         offset: int = 0,
     ) -> List[Dict[str, Any]]:
-        """
-        按 protocol_name 列出 relations（带 relation_id + payload）。
-        """
         rows = self.conn.execute(
             """
             SELECT r.relation_id, r.payload
@@ -519,25 +460,383 @@ class BigVisionDatabase:
             out.append({"relation_id": str(rid), "payload": js})
         return out
 
-    # ------------- images methods -------------
+    # ------------- Protocols CRUD/组织/采样 -------------
 
-    def export_images_by_ids(
-            self,
-            image_ids: List[str],
-            out_dir: Optional[str] = None,
-            *,
-            output: str = "png",  # 'png' | 'npy' | 'both'
-            normalize: bool = True,  # PNG 导出是否 0-255 归一化
-            zip_output: bool = False,  # 是否 zip 打包
-            zip_path: Optional[str] = None,  # 自定义 zip 输出路径
-            overwrite: bool = True,
-            sample_limit: int = 20,
-            color_order: str = "bgr",  # 默认强制按 BGR 处理三通道（避免“蓝脸”）
+    def list_protocols(self) -> List[Dict[str, Any]]:
+        """
+        列出所有 protocol 及其 relation 数。
+        """
+        rows = self.conn.execute(
+            "SELECT protocol_name, COUNT(DISTINCT relation_id) AS n FROM protocol GROUP BY protocol_name ORDER BY protocol_name"
+        ).fetchall()
+        return [{"protocol_name": str(r[0]), "n_relations": int(r[1])} for r in rows]
+
+    def get_protocol_relations(
+        self,
+        protocol_name: str,
+        *,
+        limit: Optional[int] = None,
+        offset: int = 0,
     ) -> Dict[str, Any]:
         """
-        根据一组 image_id 导出图像（PNG/NPY），并可选 zip 打包。
-        默认将三通道图像视为 BGR 来源（OpenCV 常见读法）。如你的数据确认为 RGB，可显式传 color_order="rgb"。
+        返回某 protocol 的 relation_id 列表（分页）及总数。
         """
+        n = self.conn.execute(
+            "SELECT COUNT(DISTINCT relation_id) FROM protocol WHERE protocol_name = ?",
+            [protocol_name],
+        ).fetchone()[0]
+        if n == 0:
+            return {"protocol_name": protocol_name, "total": 0, "relation_ids": []}
+        if limit is None:
+            q = "SELECT DISTINCT relation_id FROM protocol WHERE protocol_name = ? ORDER BY relation_id"
+            rels = [r[0] for r in self.conn.execute(q, [protocol_name]).fetchall()]
+        else:
+            q = "SELECT DISTINCT relation_id FROM protocol WHERE protocol_name = ? ORDER BY relation_id LIMIT ? OFFSET ?"
+            rels = [r[0] for r in self.conn.execute(q, [protocol_name, limit, offset]).fetchall()]
+        return {"protocol_name": protocol_name, "total": int(n), "relation_ids": [str(x) for x in rels]}
+
+    def create_protocol(
+        self,
+        protocol_name: str,
+        relation_ids: List[str],
+        *,
+        replace: bool = False,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        用给定 relation_ids 构建/重建一个 protocol。
+        replace=True 时会先清空同名 protocol。
+        """
+        relation_ids = list(dict.fromkeys(relation_ids))  # 去重保序
+        # 校验 relation 是否存在
+        missing, found = self._check_relations_exist(relation_ids)
+
+        if dry_run:
+            return {
+                "protocol_name": protocol_name,
+                "replace": replace,
+                "insert_rows": len(found),
+                "missing_relations": missing,
+                "dry_run": True,
+            }
+
+        self.conn.execute("BEGIN;")
+        try:
+            if replace:
+                self.conn.execute("DELETE FROM protocol WHERE protocol_name = ?", [protocol_name])
+            if found:
+                rows = [(protocol_name, rid, protocol_name) for rid in found]
+                self.conn.register("proto_df_new", self._rows_to_df(rows, ["protocol_name", "relation_id", "relation_set"]))
+                self.conn.execute("INSERT INTO protocol SELECT * FROM proto_df_new;")
+            self.conn.execute("COMMIT;")
+        except Exception:
+            self.conn.execute("ROLLBACK;")
+            raise
+
+        return {
+            "protocol_name": protocol_name,
+            "replace": replace,
+            "insert_rows": len(found),
+            "missing_relations": missing,
+            "dry_run": False,
+        }
+
+    def add_relations_to_protocol(
+        self,
+        protocol_name: str,
+        relation_ids: List[str],
+        *,
+        deduplicate: bool = True,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        往现有 protocol 追加 relations（自动去重）。
+        """
+        relation_ids = list(dict.fromkeys(relation_ids))
+        missing, found = self._check_relations_exist(relation_ids)
+
+        # 过滤已存在映射
+        existing = {
+            r[0] for r in self.conn.execute(
+                "SELECT DISTINCT relation_id FROM protocol WHERE protocol_name = ?",
+                [protocol_name],
+            ).fetchall()
+        }
+        to_add = [rid for rid in found if (rid not in existing) or not deduplicate]
+
+        if dry_run:
+            return {
+                "protocol_name": protocol_name,
+                "to_add": len(to_add),
+                "already_exists": len(found) - len(to_add),
+                "missing_relations": missing,
+                "dry_run": True,
+            }
+
+        self.conn.execute("BEGIN;")
+        try:
+            if to_add:
+                rows = [(protocol_name, rid, protocol_name) for rid in to_add]
+                self.conn.register("proto_df_add", self._rows_to_df(rows, ["protocol_name", "relation_id", "relation_set"]))
+                self.conn.execute("INSERT INTO protocol SELECT * FROM proto_df_add;")
+            self.conn.execute("COMMIT;")
+        except Exception:
+            self.conn.execute("ROLLBACK;")
+            raise
+
+        return {
+            "protocol_name": protocol_name,
+            "added": len(to_add),
+            "skipped": len(found) - len(to_add),
+            "missing_relations": missing,
+            "dry_run": False,
+        }
+
+    def remove_relations_from_protocol(
+        self,
+        protocol_name: str,
+        relation_ids: List[str],
+        *,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        从 protocol 中移除指定 relations 的映射。
+        """
+        relation_ids = list(dict.fromkeys(relation_ids))
+        if dry_run:
+            n = self.conn.execute(
+                f"SELECT COUNT(*) FROM protocol WHERE protocol_name = ? AND relation_id IN ({','.join(['?']*len(relation_ids))})",
+                [protocol_name, *relation_ids],
+            ).fetchone()[0] if relation_ids else 0
+            return {"protocol_name": protocol_name, "would_delete": int(n), "dry_run": True}
+
+        self.conn.execute("BEGIN;")
+        try:
+            if relation_ids:
+                self.conn.execute(
+                    f"DELETE FROM protocol WHERE protocol_name = ? AND relation_id IN ({','.join(['?']*len(relation_ids))})",
+                    [protocol_name, *relation_ids],
+                )
+            self.conn.execute("COMMIT;")
+        except Exception:
+            self.conn.execute("ROLLBACK;")
+            raise
+        return {"protocol_name": protocol_name, "deleted": len(relation_ids), "dry_run": False}
+
+    def delete_protocol(
+        self,
+        protocol_name: str,
+        *,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        删除整个 protocol（不影响 relations 表）。
+        """
+        cnt = self.conn.execute(
+            "SELECT COUNT(*) FROM protocol WHERE protocol_name = ?",
+            [protocol_name],
+        ).fetchone()[0]
+        if dry_run:
+            return {"protocol_name": protocol_name, "rows": int(cnt), "dry_run": True}
+
+        self.conn.execute("BEGIN;")
+        try:
+            self.conn.execute("DELETE FROM protocol WHERE protocol_name = ?", [protocol_name])
+            self.conn.execute("COMMIT;")
+        except Exception:
+            self.conn.execute("ROLLBACK;")
+            raise
+        return {"protocol_name": protocol_name, "rows": int(cnt), "dry_run": False}
+
+    def rename_protocol(
+        self,
+        old_name: str,
+        new_name: str,
+        *,
+        overwrite: bool = False,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        重命名 protocol（同时更新 relation_set = new_name）。
+        overwrite=True 时，会先删除目标同名 protocol 后再改名。
+        """
+        old_cnt = self.conn.execute(
+            "SELECT COUNT(*) FROM protocol WHERE protocol_name = ?",
+            [old_name],
+        ).fetchone()[0]
+        new_cnt = self.conn.execute(
+            "SELECT COUNT(*) FROM protocol WHERE protocol_name = ?",
+            [new_name],
+        ).fetchone()[0]
+
+        if not old_cnt:
+            return {"ok": False, "error": "source protocol not found", "old_name": old_name, "new_name": new_name}
+
+        if dry_run:
+            return {
+                "ok": True,
+                "old_rows": int(old_cnt),
+                "target_exists": bool(new_cnt),
+                "overwrite": overwrite,
+                "dry_run": True,
+            }
+
+        self.conn.execute("BEGIN;")
+        try:
+            if new_cnt and overwrite:
+                self.conn.execute("DELETE FROM protocol WHERE protocol_name = ?", [new_name])
+            # 同时更新两列
+            self.conn.execute(
+                "UPDATE protocol SET protocol_name = ?, relation_set = ? WHERE protocol_name = ?",
+                [new_name, new_name, old_name],
+            )
+            self.conn.execute("COMMIT;")
+        except Exception:
+            self.conn.execute("ROLLBACK;")
+            raise
+
+        return {"ok": True, "old_rows": int(old_cnt), "dry_run": False}
+
+    def copy_protocol(
+        self,
+        src_protocol: str,
+        dst_protocol: str,
+        *,
+        overwrite: bool = False,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        拷贝一个 protocol 到新名字（去重）。overwrite=True 时先清空目标。
+        """
+        rels = [r[0] for r in self.conn.execute(
+            "SELECT DISTINCT relation_id FROM protocol WHERE protocol_name = ?",
+            [src_protocol],
+        ).fetchall()]
+        if not rels:
+            return {"ok": False, "error": "source protocol empty or not found", "src": src_protocol, "dst": dst_protocol}
+
+        if dry_run:
+            dst_cnt = self.conn.execute(
+                "SELECT COUNT(*) FROM protocol WHERE protocol_name = ?",
+                [dst_protocol],
+            ).fetchone()[0]
+            return {
+                "ok": True,
+                "src_relations": len(rels),
+                "dst_exists": bool(dst_cnt),
+                "overwrite": overwrite,
+                "dry_run": True,
+            }
+
+        return self.create_protocol(dst_protocol, rels, replace=overwrite, dry_run=False)
+
+    def merge_protocols(
+        self,
+        new_protocol: str,
+        sources: List[str],
+        *,
+        mode: str = "union",   # 'union' | 'intersect'
+        replace: bool = True,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        将多个 protocol 合并为新 protocol（并集/交集）。
+        """
+        sources = [s for s in sources if s]
+        if not sources:
+            return {"ok": False, "error": "no source protocols"}
+        sets: List[Set[str]] = []
+        for s in sources:
+            rels = {r[0] for r in self.conn.execute(
+                "SELECT DISTINCT relation_id FROM protocol WHERE protocol_name = ?",
+                [s],
+            ).fetchall()}
+            if not rels:
+                sets.append(set())
+            else:
+                sets.append(rels)
+
+        if mode == "union":
+            merged = set().union(*sets) if sets else set()
+        elif mode == "intersect":
+            merged = set.intersection(*sets) if sets else set()
+        else:
+            return {"ok": False, "error": "mode must be 'union' or 'intersect'"}
+
+        rel_ids = sorted(merged)
+        if dry_run:
+            return {"ok": True, "new_protocol": new_protocol, "n_relations": len(rel_ids), "mode": mode, "replace": replace, "dry_run": True}
+
+        return self.create_protocol(new_protocol, rel_ids, replace=replace, dry_run=False)
+
+    def build_protocol_from_relations(
+        self,
+        protocol_name: str,
+        relation_ids: List[str],
+        *,
+        replace: bool = False,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        直接用一个 relation_id 列表构建/重建 protocol（与 create_protocol 等价，命名更直观）。
+        """
+        return self.create_protocol(protocol_name, relation_ids, replace=replace, dry_run=dry_run)
+
+    def sample_protocol(
+        self,
+        src_protocol: str,
+        k: int,
+        *,
+        seed: Optional[int] = None,
+        dst_protocol: Optional[str] = None,
+        replace: bool = True,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        从指定 protocol 随机采样 k 条 relation_id；若提供 dst_protocol，则将采样子集写为一个新 protocol。
+        """
+        if k <= 0:
+            return {"ok": False, "error": "k must be > 0"}
+
+        # DuckDB 采样：ORDER BY random()
+        if seed is None:
+            rows = self.conn.execute(
+                "SELECT DISTINCT relation_id FROM protocol WHERE protocol_name = ? ORDER BY random() LIMIT ?",
+                [src_protocol, k],
+            ).fetchall()
+        else:
+            # 使用固定种子：通过内置 random() 不直接支持 seed，这里用简化策略：
+            # 取所有 relation_id 后在 Python 端做可复现实验（避免大表OOM时可分块改造）
+            all_rows = self.conn.execute(
+                "SELECT DISTINCT relation_id FROM protocol WHERE protocol_name = ?",
+                [src_protocol],
+            ).fetchall()
+            import random as _random
+            _random.seed(int(seed))
+            rows = [(_rid,) for _rid in _random.sample([r[0] for r in all_rows], k=min(k, len(all_rows)))]
+
+        sample_rel_ids = [r[0] for r in rows]
+        if not dst_protocol:
+            return {"ok": True, "sample_size": len(sample_rel_ids), "relation_ids": sample_rel_ids}
+
+        # 写入为新 protocol
+        return self.create_protocol(dst_protocol, sample_rel_ids, replace=replace, dry_run=dry_run)
+
+    # ------------- images 导出 -------------
+
+    def export_images_by_ids(
+        self,
+        image_ids: List[str],
+        out_dir: Optional[str] = None,
+        *,
+        output: str = "png",
+        normalize: bool = True,
+        zip_output: bool = False,
+        zip_path: Optional[str] = None,
+        overwrite: bool = True,
+        sample_limit: int = 20,
+        color_order: str = "bgr",
+    ) -> Dict[str, Any]:
         import time
         import uuid as _uuid
         import shutil
@@ -558,7 +857,6 @@ class BigVisionDatabase:
             out_dir_path = Path(out_dir)
         out_dir_path.mkdir(parents=True, exist_ok=True)
 
-        # 查询 images 表
         def _fetch_rows(ids: List[str]) -> Dict[str, Dict[str, Any]]:
             if not ids:
                 return {}
@@ -584,10 +882,8 @@ class BigVisionDatabase:
         id2row = _fetch_rows(image_ids)
         missing = [iid for iid in image_ids if iid not in id2row]
 
-        # 数组 -> 适合写 PNG 的 uint8（保持 HxW 或 HxWxC）
         def _prep_uint8(arr: _np.ndarray) -> _np.ndarray:
             a = _np.asarray(arr)
-            # (C,H,W) -> (H,W,C)
             if a.ndim == 3 and a.shape[0] in (1, 3) and a.shape[2] not in (1, 3):
                 a = _np.moveaxis(a, 0, 2)
             while a.ndim > 3:
@@ -602,7 +898,6 @@ class BigVisionDatabase:
                 else:
                     a = _np.zeros_like(a, dtype=_np.float32)
                 a = (a * 255.0).round().clip(0, 255).astype(_np.uint8)
-            # 统一成 HxW 或 HxWx3
             if a.ndim == 2:
                 return a
             if a.ndim == 3:
@@ -612,19 +907,18 @@ class BigVisionDatabase:
                     return a[:, :, :3]
             return a.reshape(a.shape[0], a.shape[1]).astype(_np.uint8)
 
-        # 写 PNG：优先 imageio，回退 cv2
         try:
             import imageio.v3 as iio  # type: ignore
             def _save_png(dst: Path, img: _np.ndarray) -> bool:
                 iio.imwrite(str(dst), img)
                 return True
-            writer_backend = "imageio"  # 期望 RGB
+            writer_backend = "imageio"
         except Exception:
             try:
                 import cv2  # type: ignore
                 def _save_png(dst: Path, img: _np.ndarray) -> bool:
                     return bool(cv2.imwrite(str(dst), img))
-                writer_backend = "cv2"  # 期望 BGR
+                writer_backend = "cv2"
             except Exception:
                 raise RuntimeError("Neither imageio nor OpenCV is available to write PNG files.")
 
@@ -647,17 +941,14 @@ class BigVisionDatabase:
                     return candidate
                 k += 1
 
-        # 主循环（保持输入顺序）
         for idx, iid in enumerate(image_ids):
             row = id2row.get(iid)
             if row is None:
                 continue
-
             src_path = (Path(self.database_root) / row["uri"]).resolve()
             alias = row["alias"] or row["modality"] or iid
             base = f"{idx:04d}_{alias}"
 
-            # PNG
             if output in ("png", "both"):
                 try:
                     import numpy as _np2
@@ -665,9 +956,9 @@ class BigVisionDatabase:
                     img = _prep_uint8(arr)
                     if isinstance(img, _np2.ndarray) and img.ndim == 3 and img.shape[2] == 3:
                         if writer_backend == "imageio" and color_order == "bgr":
-                            img = img[:, :, ::-1]  # BGR -> RGB
+                            img = img[:, :, ::-1]
                         elif writer_backend == "cv2" and color_order == "rgb":
-                            img = img[:, :, ::-1]  # RGB -> BGR
+                            img = img[:, :, ::-1]
                     dst_name = _safe_name(base, "png")
                     dst_path = out_dir_path / dst_name
                     if dst_path.exists() and not overwrite:
@@ -678,7 +969,6 @@ class BigVisionDatabase:
                 except Exception as e:
                     print(f"[WARN] PNG export failed for image_id={iid}: {e}", file=sys.stderr)
 
-            # NPY
             if output in ("npy", "both"):
                 try:
                     import shutil as _sh
@@ -692,7 +982,6 @@ class BigVisionDatabase:
                 except Exception as e:
                     print(f"[WARN] NPY copy failed for image_id={iid}: {e}", file=sys.stderr)
 
-        # ZIP（可选）
         out_zip: Optional[Path] = None
         if zip_output:
             import shutil
@@ -731,10 +1020,25 @@ class BigVisionDatabase:
         import pandas as pd
         return pd.DataFrame(rows, columns=columns)
 
+    def _check_relations_exist(self, relation_ids: List[str]) -> Tuple[List[str], List[str]]:
+        """
+        返回 (missing, found) 列表（均保序）。
+        """
+        if not relation_ids:
+            return ([], [])
+        placeholders = ",".join(["?"] * len(relation_ids))
+        rows = self.conn.execute(
+            f"SELECT relation_id FROM relations WHERE relation_id IN ({placeholders})",
+            relation_ids,
+        ).fetchall()
+        found_set = {r[0] for r in rows}
+        found = [rid for rid in relation_ids if rid in found_set]
+        missing = [rid for rid in relation_ids if rid not in found_set]
+        return (missing, found)
+
     # ---------------- 生命周期 ----------------
 
     def close(self) -> None:
-        """关闭连接（可重复调用）"""
         try:
             self.conn.close()
         except Exception:
@@ -756,20 +1060,18 @@ if __name__ == "__main__":
         database_root = cfg["database_root"]
         print(f"[INFO] database_root from Config.setting: {database_root}")
     except Exception:
-        # 2) 失败则回落到环境变量 DB_ROOT，否则使用 ./bigvision_db
         database_root = os.environ.get("DB_ROOT", os.path.abspath("./bigvision_db"))
         print(f"[INFO] Using fallback database_root: {database_root}")
 
-    # 并发默认：max(8, CPU)
     workers = max(8, (os.cpu_count() or 8))
 
     db = None
     try:
         db = BigVisionDatabase(
             database_root=database_root,
-            duckdb_path=None,        # 默认 <database_root>/db/catalog.duckdb
+            duckdb_path=None,
             max_workers=workers,
-            threads=0,               # 让 DuckDB 自己决定
+            threads=0,
         )
 
         # ------- DB 概览 -------
@@ -777,83 +1079,112 @@ if __name__ == "__main__":
         print("[OK] DB Summary:")
         print(json.dumps(summary, ensure_ascii=False, indent=2))
 
-        # ------- 随机采样导出（示例） -------
-        sample_n = 16
+        # ------- 随机采样导出（示例：注释掉即可） -------
+        sample_n = 8
         rows = db.conn.execute(
             "SELECT image_id FROM images ORDER BY random() LIMIT ?;",
             [sample_n],
         ).fetchall()
         sample_ids = [r[0] for r in rows]
-        # if sample_ids:
-        #     export_res = db.export_images_by_ids(
-        #         sample_ids,
-        #         out_dir=None,
-        #         output="png",
-        #         normalize=True,
-        #         zip_output=True,
-        #         zip_path=None,
-        #         overwrite=True,
-        #         sample_limit=10,
-        #     )
-        #     print("[OK] Export test result:")
-        #     print(json.dumps(export_res, ensure_ascii=False, indent=2))
-        # else:
-        #     print("[INFO] No images found in DB; skip export test.")
-
-        # ------- Relations CRUD（dry_run 测试，不实际修改） -------
-        # 1) 构造一个新 relation 的 payload（使用随机采样的 image_ids）
-        if not sample_ids:
-            # 如果没有图片，跳过 CRUD 测试
-            print("[INFO] Skip relation CRUD dry-run tests (no images).")
+        if sample_ids:
+            print(f"[INFO] sampled {len(sample_ids)} image_ids")
         else:
-            new_payload = {
-                "task_type": "demo",
-                "annotation": {"note": "dry-run create test"},
-                "image_ids": sample_ids[: min(3, len(sample_ids))],  # 取前 3 张
-            }
-            print("\n[TEST] add_relation (dry_run)")
-            add_res = db.add_relation(payload=new_payload, protocols=["demo_proto", "debug_view"], dry_run=True)
-            print(json.dumps(add_res, ensure_ascii=False, indent=2))
+            print("[INFO] No images found in DB; skip export test.")
 
-            # 2) 挑选一条已存在的 relation 做 query/update/delete（dry_run）
-            exist_row = db.conn.execute("SELECT relation_id, payload FROM relations LIMIT 1").fetchone()
-            if exist_row:
-                exist_rid = exist_row[0]
-                print("\n[TEST] get_relation")
-                got = db.get_relation(exist_rid)
-                print(json.dumps(got, ensure_ascii=False, indent=2))
+        # ------- Relations CRUD（dry_run） -------
+        # if sample_ids:
+        #     new_payload = {
+        #         "task_type": "demo",
+        #         "annotation": {"note": "dry-run create test"},
+        #         "image_ids": sample_ids[: min(3, len(sample_ids))],
+        #     }
+        #     print("\n[TEST] add_relation (dry_run)")
+        #     print(json.dumps(db.add_relation(payload=new_payload, protocols=["demo_proto", "debug_view"], dry_run=True),
+        #                      ensure_ascii=False, indent=2))
+        #
+        # exist_row = db.conn.execute("SELECT relation_id FROM relations LIMIT 1").fetchone()
+        # if exist_row:
+        #     exist_rid = exist_row[0]
+        #     print("\n[TEST] get_relation")
+        #     print(json.dumps(db.get_relation(exist_rid), ensure_ascii=False, indent=2))
+        #
+        #     print("\n[TEST] update_relation (dry_run)")
+        #     upd_payload = {
+        #         "task_type": "updated_demo",
+        #         "annotation": {"note": "dry-run update"},
+        #         "image_ids": sample_ids[: min(2, len(sample_ids))] if sample_ids else [],
+        #     }
+        #     print(json.dumps(db.update_relation(
+        #         exist_rid,
+        #         payload=upd_payload,
+        #         add_protocols=["extra_proto"],
+        #         remove_protocols=["debug_view"],
+        #         dry_run=True,
+        #     ), ensure_ascii=False, indent=2))
+        #
+        #     print("\n[TEST] delete_relation (dry_run)")
+        #     print(json.dumps(db.delete_relation(exist_rid, dry_run=True), ensure_ascii=False, indent=2))
+        # else:
+        #     print("[INFO] No existing relations to test update/delete.")
 
-                print("\n[TEST] update_relation (dry_run)")
-                # 替换 payload：在原 payload 基础上添加一个字段（不去真正读出再写，纯演示）
-                upd_payload = {
-                    "task_type": "updated_demo",
-                    "annotation": {"note": "dry-run update"},
-                    "image_ids": sample_ids[: min(2, len(sample_ids))],  # 换一组 id 测试校验
-                }
-                upd_res = db.update_relation(
-                    exist_rid,
-                    payload=upd_payload,
-                    add_protocols=["extra_proto"],
-                    remove_protocols=["debug_view"],  # 即便不存在也不报错
-                    dry_run=True,
-                )
-                print(json.dumps(upd_res, ensure_ascii=False, indent=2))
+        # ------- Protocols CRUD/组织/采样（全部 dry_run） -------
+        print("\n[TEST] list_protocols()")
+        print(json.dumps(db.list_protocols(), ensure_ascii=False, indent=2))
 
-                print("\n[TEST] delete_relation (dry_run)")
-                del_res = db.delete_relation(exist_rid, dry_run=True)
-                print(json.dumps(del_res, ensure_ascii=False, indent=2))
-            else:
-                print("[INFO] No existing relations to test update/delete.")
+        # 选择一个已有 protocol 做采样
+        proto_row = db.conn.execute("SELECT DISTINCT protocol_name FROM protocol LIMIT 1").fetchone()
+        if proto_row:
+            p0 = proto_row[0]
+            print(f"\n[TEST] get_protocol_relations('{p0}', limit=5)")
+            print(json.dumps(db.get_protocol_relations(p0, limit=5), ensure_ascii=False, indent=2))
 
-            # 3) 列出某个 protocol 下的 relations
-            proto_row = db.conn.execute("SELECT DISTINCT protocol_name FROM protocol LIMIT 1").fetchone()
-            if proto_row:
-                pname = proto_row[0]
-                print(f"\n[TEST] list_relations_by_protocol('{pname}')")
-                lst = db.list_relations_by_protocol(pname, limit=5, offset=0)
-                print(json.dumps(lst, ensure_ascii=False, indent=2))
-            else:
-                print("[INFO] No protocol found to list relations.")
+            # 采样并生成新 protocol（dry_run）
+            new_pname = f"{p0}_sample_demo"
+            print(f"\n[TEST] sample_protocol('{p0}', k=5, dst_protocol='{new_pname}') (dry_run)")
+            print(json.dumps(db.sample_protocol(p0, 5, seed=42, dst_protocol=new_pname, replace=True, dry_run=True),
+                             ensure_ascii=False, indent=2))
+
+            # 拷贝到新 protocol（dry_run）
+            copy_name = f"{p0}_copy_demo"
+            print(f"\n[TEST] copy_protocol('{p0}' -> '{copy_name}') (dry_run)")
+            print(json.dumps(db.copy_protocol(p0, copy_name, overwrite=True, dry_run=True), ensure_ascii=False, indent=2))
+
+            # 往 protocol 追加/移除 relations（dry_run）
+            rels5 = [r[0] for r in db.conn.execute(
+                "SELECT relation_id FROM protocol WHERE protocol_name = ? LIMIT 5", [p0]
+            ).fetchall()]
+            print(f"\n[TEST] add_relations_to_protocol('{p0}', {len(rels5)} ids) (dry_run)")
+            print(json.dumps(db.add_relations_to_protocol(p0, rels5, deduplicate=True, dry_run=True),
+                             ensure_ascii=False, indent=2))
+
+            print(f"\n[TEST] remove_relations_from_protocol('{p0}', {len(rels5)} ids) (dry_run)")
+            print(json.dumps(db.remove_relations_from_protocol(p0, rels5, dry_run=True),
+                             ensure_ascii=False, indent=2))
+
+        # 合并两个 protocol（若存在至少两个）
+        proto_two = db.conn.execute("SELECT DISTINCT protocol_name FROM protocol LIMIT 2").fetchall()
+        if len(proto_two) >= 2:
+            pA, pB = proto_two[0][0], proto_two[1][0]
+            merged_name = f"merge_{pA}_{pB}_union_demo"
+            print(f"\n[TEST] merge_protocols(['{pA}','{pB}'], mode='union' -> '{merged_name}') (dry_run)")
+            print(json.dumps(db.merge_protocols(merged_name, [pA, pB], mode="union", replace=True, dry_run=True),
+                             ensure_ascii=False, indent=2))
+        else:
+            print("[INFO] Not enough protocols to test merge.")
+
+        # 重命名 protocol（dry_run）
+        if proto_row:
+            p0 = proto_row[0]
+            renamed = f"{p0}_renamed_demo"
+            print(f"\n[TEST] rename_protocol('{p0}' -> '{renamed}') (dry_run)")
+            print(json.dumps(db.rename_protocol(p0, renamed, overwrite=True, dry_run=True),
+                             ensure_ascii=False, indent=2))
+
+        # 删除 protocol（dry_run）
+        if proto_row:
+            del_name = f"{proto_row[0]}_to_delete_demo"
+            print(f"\n[TEST] delete_protocol('{del_name}') (dry_run)")
+            print(json.dumps(db.delete_protocol(del_name, dry_run=True), ensure_ascii=False, indent=2))
 
     except Exception as e:
         print(f"[ERROR] run failed: {e}", file=sys.stderr)
