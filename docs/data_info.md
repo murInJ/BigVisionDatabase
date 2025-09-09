@@ -47,7 +47,7 @@ CREATE TABLE IF NOT EXISTS relations (
 );
 ```
 
-### 3) 表：`protocol`（由 `protocol_entries` 重命名）
+### 3) 表：`protocol`
 
 > 将关系分配到一个或多个“协议/集合”中
 
@@ -66,19 +66,13 @@ CREATE INDEX IF NOT EXISTS idx_protocol_name ON protocol(protocol_name);
 
 ## `relations.payload` 示例
 
-> 除 `image_ids` 外，其它键（如 `task_type`/`annotation`/`meta`）**完全由 Adaptor 决定**并原样写入。
+> 除 `image_ids` 外，其它键（如 `task_type`/`annotation`）**完全由 Adaptor 决定**并原样写入。
 
 ```json
 {
   "task_type": "classification",
   "annotation": {
     "label": 1
-  },
-  "meta": {
-    "source": "PADISI",
-    "version": 2,
-    "difficulty": "hard",
-    "note": "produced by adaptor v1.1"
   },
   "image_ids": [
     "a1b2c3d4e5f6...",

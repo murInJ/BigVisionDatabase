@@ -41,7 +41,6 @@ class Adaptor(BaseAdaptor):
                 "task_type": "classification",
                 "annotation": {
                     "label": data["label"],
-                    "dataset": data["dataset"],
                 }
             }
         }

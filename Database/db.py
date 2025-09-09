@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import traceback
+import uuid
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -28,6 +29,9 @@ class BigVisionDatabase:
       - 初始化 schema
       - 提供写入入口（单样本 / 单 adaptor / registry）
       - 提供垃圾回收：清理磁盘孤儿 .npy 文件，并报告 DB 指向缺失文件的条目
+      - 提供 DB 概览统计
+      - 提供按 image_id 导出图像（PNG/NPY，并可 zip 打包）
+      - 提供 relations 的增删查改（CRUD）
 
     目录约定：
       <database_root>/images/<dataset_name>/<UUID>.npy
@@ -136,32 +140,8 @@ class BigVisionDatabase:
     ) -> Dict[str, Any]:
         """
         清理/报告不一致数据（幂等、只针对“单机本地路径”）：
-
-        1) **孤儿文件**（Orphan Files）：
-           - 条件：磁盘上的 .npy 文件，其 image_id（文件名 stem）不在 DB images.image_id 中，
-             或者虽在 DB 中但其相对路径与 DB 的 uri 不一致（视为“路径不一致的副本”）。
-           - 行为：默认仅报告；若 remove_orphan_files=True，则实际删除这些孤儿文件。
-
-        2) **DB 缺失文件**（Missing File Rows）：
-           - 条件：DB images 表中的某条记录，其 uri 指向的文件在磁盘上不存在。
-           - 行为：默认仅报告（不删除 DB 行，以免破坏 relations.payload.image_ids 的一致性）。
-
-        Args:
-            remove_orphan_files: True 则删除孤儿 .npy 文件；默认 False 只做报告。
-            check_db_missing_files: 是否扫描 DB 行并报告缺失文件；默认 True。
-            report_limit: 报告中示例文件/行的最大展示数量。
-            verbose: 打印更详细的过程日志。
-
-        Returns:
-            {
-              "files_scanned": int,
-              "db_images": int,
-              "orphan_files": int,
-              "orphan_removed": int,
-              "orphan_samples": [<相对路径> ...],
-              "missing_file_rows": int,
-              "missing_samples": [(image_id, uri), ...],
-            }
+        1) 孤儿文件（磁盘存在但 DB 无引用或路径不一致）
+        2) DB 缺失文件（DB 行指向的文件在磁盘上不存在）
         """
         root = Path(self.database_root)
         images_root = root / "images"
@@ -181,10 +161,8 @@ class BigVisionDatabase:
             rel_uri = p.relative_to(root).as_posix()  # "images/<dataset>/<uuid>.npy"
 
             if stem not in db_ids:
-                # 完全没有 DB 记录 -> 孤儿
                 orphan_paths.append(p)
             else:
-                # 有 DB 记录，但路径不一致（多半来自异常中断后的重试）
                 if id2uri.get(stem) != rel_uri:
                     orphan_paths.append(p)
 
@@ -194,12 +172,11 @@ class BigVisionDatabase:
         if orphan_paths:
             if verbose:
                 print(f"[GC] Found {len(orphan_paths)} orphan files.")
-            # 收集样例
             orphan_samples = [op.relative_to(root).as_posix() for op in orphan_paths[:report_limit]]
             if remove_orphan_files:
                 for p in orphan_paths:
                     try:
-                        p.unlink(missing_ok=True)  # py>=3.8
+                        p.unlink(missing_ok=True)
                         orphan_removed += 1
                     except TypeError:
                         try:
@@ -207,7 +184,6 @@ class BigVisionDatabase:
                                 p.unlink()
                                 orphan_removed += 1
                         except Exception:
-                            # 忽略个别删除失败
                             pass
 
         # --- 可选：检查 DB 行对应的文件是否缺失 ---
@@ -220,11 +196,9 @@ class BigVisionDatabase:
                     missing_file_rows += 1
                     if len(missing_samples) < report_limit:
                         missing_samples.append((image_id, uri))
-
             if verbose and missing_file_rows:
                 print(f"[GC] Found {missing_file_rows} DB rows pointing to missing files.")
 
-        # --- 汇总 ---
         summary: Dict[str, Any] = {
             "files_scanned": files_scanned,
             "db_images": db_images_count,
@@ -238,68 +212,32 @@ class BigVisionDatabase:
             print(f"[GC] Summary: {summary}")
         return summary
 
-    # ---------------- 生命周期 ----------------
-
-    def close(self) -> None:
-        """关闭连接（可重复调用）"""
-        try:
-            self.conn.close()
-        except Exception:
-            pass
-
-    # 上下文管理（可选）
-    def __enter__(self) -> "BigVisionDatabase":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.close()
-
-    # -------------- DB summary ---------------
+    # ---------------- 概览统计 ----------------
 
     def get_db_summary(self) -> Dict[str, Any]:
         """
-        返回数据库概览汇总：
-
-        {
-          "totals": {
-            "images": <int>,             # images 表总行数
-            "relations": <int>,          # relations 表总行数
-            "protocol_rows": <int>,      # protocol 表总行数
-            "protocols": <int>           # 不同 protocol_name 的数量
-          },
-          "protocols": [
-            {
-              "protocol_name": <str>,
-              "n_relations": <int>,      # 该 protocol_name 下关联的去重 relation_id 数
-              "datasets": [<str>, ...],  # 该 protocol 覆盖到的 images.dataset_name 去重集合（按字母序）
-            },
-            ...
-          ]
-        }
+        返回数据库概览汇总（总数 + 按 protocol 汇总数据集覆盖）。
         """
-        # 1) 顶部 totals
         totals = {}
         totals["images"] = self.conn.execute("SELECT COUNT(*) FROM images").fetchone()[0]
         totals["relations"] = self.conn.execute("SELECT COUNT(*) FROM relations").fetchone()[0]
         totals["protocol_rows"] = self.conn.execute("SELECT COUNT(*) FROM protocol").fetchone()[0]
         totals["protocols"] = self.conn.execute("SELECT COUNT(DISTINCT protocol_name) FROM protocol").fetchone()[0]
 
-        # 2) 若没有任何 protocol 行，直接返回
         proto_rows = self.conn.execute("SELECT protocol_name, relation_id FROM protocol").fetchall()
         if not proto_rows:
             return {"totals": totals, "protocols": []}
 
-        # 3) protocol_name -> set(relation_id)
         from collections import defaultdict
         proto_to_relids: Dict[str, set] = defaultdict(set)
         for pname, rid in proto_rows:
             proto_to_relids[str(pname)].add(str(rid))
 
-        # 4) 拉取 relations.payload 中的 image_ids（一次或分块）
+        # 批量拉取 relations.payload
         def _chunks(seq, n=1000):
             it = list(seq)
             for i in range(0, len(it), n):
-                yield it[i:i+n]
+                yield it[i:i + n]
 
         all_relids = set().union(*proto_to_relids.values())
         relid_to_imgids: Dict[str, List[str]] = {}
@@ -310,16 +248,15 @@ class BigVisionDatabase:
                     f"SELECT relation_id, payload FROM relations WHERE relation_id IN ({placeholders})",
                     chunk,
                 ).fetchall()
-                import json as _json
                 for rid, payload in rows:
                     try:
-                        js = _json.loads(payload)
+                        js = json.loads(payload)
                         img_ids = js.get("image_ids", []) or []
                         relid_to_imgids[str(rid)] = [str(x) for x in img_ids]
                     except Exception:
                         relid_to_imgids[str(rid)] = []
 
-        # 5) 汇总所有 image_id 并查询其 dataset_name
+        # 查询 images.dataset_name
         all_img_ids = set()
         for rids in proto_to_relids.values():
             for rid in rids:
@@ -336,7 +273,6 @@ class BigVisionDatabase:
                 for iid, ds in rows:
                     imgid_to_ds[str(iid)] = str(ds)
 
-        # 6) 逐 protocol 汇总：n_relations & datasets
         out_list: List[Dict[str, Any]] = []
         for pname in sorted(proto_to_relids.keys()):
             relids = proto_to_relids[pname]
@@ -353,6 +289,235 @@ class BigVisionDatabase:
             })
 
         return {"totals": totals, "protocols": out_list}
+
+    # ------------- Relations CRUD -------------
+
+    def add_relation(
+        self,
+        *,
+        payload: Dict[str, Any],
+        protocols: Optional[List[str]] = None,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        新增一条 relation。payload 必须包含 image_ids(list)。
+        协议列表 protocols（可为空）会将该 relation 归入多个 protocol（relation_set=protocol_name）。
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("payload must be a dict")
+        image_ids = payload.get("image_ids") or []
+        if not isinstance(image_ids, list):
+            raise ValueError("payload['image_ids'] must be a list")
+
+        # 校验 image_ids 是否存在（仅报告）
+        missing = []
+        if image_ids:
+            placeholders = ",".join(["?"] * len(image_ids))
+            q = f"SELECT image_id FROM images WHERE image_id IN ({placeholders})"
+            found = {r[0] for r in self.conn.execute(q, image_ids).fetchall()}
+            missing = [iid for iid in image_ids if iid not in found]
+
+        rid = uuid.uuid4().hex
+        payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+
+        if dry_run:
+            return {
+                "relation_id": rid,
+                "insert_relations": 1,
+                "insert_protocol": len(protocols or []),
+                "missing_image_ids": missing,
+                "dry_run": True,
+            }
+
+        self.conn.execute("BEGIN;")
+        try:
+            self.conn.execute(
+                "INSERT INTO relations (relation_id, payload) VALUES (?, ?)",
+                [rid, payload_json],
+            )
+            if protocols:
+                proto_rows = [(p, rid, p) for p in protocols]
+                self.conn.register("proto_df_tmp", self._rows_to_df(proto_rows, ["protocol_name", "relation_id", "relation_set"]))
+                self.conn.execute("INSERT INTO protocol SELECT * FROM proto_df_tmp;")
+            self.conn.execute("COMMIT;")
+        except Exception:
+            self.conn.execute("ROLLBACK;")
+            raise
+
+        return {
+            "relation_id": rid,
+            "insert_relations": 1,
+            "insert_protocol": len(protocols or []),
+            "missing_image_ids": missing,
+            "dry_run": False,
+        }
+
+    def get_relation(self, relation_id: str) -> Optional[Dict[str, Any]]:
+        """
+        读取单条 relation：返回 {relation_id, payload(dict), protocols:[...]} 或 None
+        """
+        row = self.conn.execute(
+            "SELECT payload FROM relations WHERE relation_id = ?",
+            [relation_id],
+        ).fetchone()
+        if row is None:
+            return None
+        payload = json.loads(row[0])
+        prots = [r[0] for r in self.conn.execute(
+            "SELECT protocol_name FROM protocol WHERE relation_id = ? ORDER BY protocol_name",
+            [relation_id],
+        ).fetchall()]
+        return {"relation_id": relation_id, "payload": payload, "protocols": prots}
+
+    def update_relation(
+        self,
+        relation_id: str,
+        *,
+        payload: Optional[Dict[str, Any]] = None,           # 若提供则全量替换 payload
+        add_protocols: Optional[List[str]] = None,          # 需要新增归属的协议名
+        remove_protocols: Optional[List[str]] = None,       # 需要移除归属的协议名
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        更新 relation：可替换 payload、增删协议归属。
+        """
+        # 是否存在
+        exists = self.conn.execute(
+            "SELECT COUNT(*) FROM relations WHERE relation_id = ?",
+            [relation_id],
+        ).fetchone()[0]
+        if not exists:
+            return {"relation_id": relation_id, "updated": False, "error": "relation not found"}
+
+        # 检查 payload 合法性（如包含 image_ids 则校验）
+        missing = []
+        if payload is not None:
+            img_ids = payload.get("image_ids") if isinstance(payload, dict) else None
+            if img_ids is not None and not isinstance(img_ids, list):
+                raise ValueError("payload['image_ids'] must be a list when provided")
+            if img_ids:
+                placeholders = ",".join(["?"] * len(img_ids))
+                q = f"SELECT image_id FROM images WHERE image_id IN ({placeholders})"
+                found = {r[0] for r in self.conn.execute(q, img_ids).fetchall()}
+                missing = [iid for iid in img_ids if iid not in found]
+
+        add_protocols = add_protocols or []
+        remove_protocols = remove_protocols or []
+
+        if dry_run:
+            return {
+                "relation_id": relation_id,
+                "replace_payload": payload is not None,
+                "add_protocols": add_protocols,
+                "remove_protocols": remove_protocols,
+                "missing_image_ids": missing,
+                "dry_run": True,
+            }
+
+        self.conn.execute("BEGIN;")
+        try:
+            if payload is not None:
+                payload_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+                self.conn.execute(
+                    "UPDATE relations SET payload = ? WHERE relation_id = ?",
+                    [payload_json, relation_id],
+                )
+            # 删除协议
+            if remove_protocols:
+                placeholders = ",".join(["?"] * len(remove_protocols))
+                self.conn.execute(
+                    f"DELETE FROM protocol WHERE relation_id = ? AND protocol_name IN ({placeholders})",
+                    [relation_id, *remove_protocols],
+                )
+            # 新增协议（去重）
+            if add_protocols:
+                # 先查已有
+                existing = {r[0] for r in self.conn.execute(
+                    "SELECT protocol_name FROM protocol WHERE relation_id = ?",
+                    [relation_id],
+                ).fetchall()}
+                to_add = [p for p in add_protocols if p not in existing]
+                if to_add:
+                    rows = [(p, relation_id, p) for p in to_add]
+                    self.conn.register("proto_df_tmp2", self._rows_to_df(rows, ["protocol_name", "relation_id", "relation_set"]))
+                    self.conn.execute("INSERT INTO protocol SELECT * FROM proto_df_tmp2;")
+
+            self.conn.execute("COMMIT;")
+        except Exception:
+            self.conn.execute("ROLLBACK;")
+            raise
+
+        return {
+            "relation_id": relation_id,
+            "replace_payload": payload is not None,
+            "add_protocols": add_protocols,
+            "remove_protocols": remove_protocols,
+            "missing_image_ids": missing,
+            "dry_run": False,
+        }
+
+    def delete_relation(
+        self,
+        relation_id: str,
+        *,
+        dry_run: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        删除 relation（及其在 protocol 中的引用）。不删除 images。
+        """
+        exists = self.conn.execute(
+            "SELECT COUNT(*) FROM relations WHERE relation_id = ?",
+            [relation_id],
+        ).fetchone()[0]
+        if not exists:
+            return {"relation_id": relation_id, "deleted": False, "error": "relation not found"}
+
+        if dry_run:
+            ref_cnt = self.conn.execute(
+                "SELECT COUNT(*) FROM protocol WHERE relation_id = ?",
+                [relation_id],
+            ).fetchone()[0]
+            return {"relation_id": relation_id, "deleted": True, "protocol_refs": int(ref_cnt), "dry_run": True}
+
+        self.conn.execute("BEGIN;")
+        try:
+            self.conn.execute("DELETE FROM protocol WHERE relation_id = ?", [relation_id])
+            self.conn.execute("DELETE FROM relations WHERE relation_id = ?", [relation_id])
+            self.conn.execute("COMMIT;")
+        except Exception:
+            self.conn.execute("ROLLBACK;")
+            raise
+        return {"relation_id": relation_id, "deleted": True, "dry_run": False}
+
+    def list_relations_by_protocol(
+        self,
+        protocol_name: str,
+        *,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> List[Dict[str, Any]]:
+        """
+        按 protocol_name 列出 relations（带 relation_id + payload）。
+        """
+        rows = self.conn.execute(
+            """
+            SELECT r.relation_id, r.payload
+            FROM protocol p
+            JOIN relations r ON p.relation_id = r.relation_id
+            WHERE p.protocol_name = ?
+            ORDER BY r.relation_id
+            LIMIT ? OFFSET ?
+            """,
+            [protocol_name, limit, offset],
+        ).fetchall()
+        out: List[Dict[str, Any]] = []
+        for rid, payload in rows:
+            try:
+                js = json.loads(payload)
+            except Exception:
+                js = {"_raw": payload}
+            out.append({"relation_id": str(rid), "payload": js})
+        return out
 
     # ------------- images methods -------------
 
@@ -371,8 +536,7 @@ class BigVisionDatabase:
     ) -> Dict[str, Any]:
         """
         根据一组 image_id 导出图像（PNG/NPY），并可选 zip 打包。
-        默认将三通道图像视为 **BGR 来源**（OpenCV 常见读法），从而避免“把 BGR 当 RGB 写”的蓝脸问题。
-        如你的数据确认为 RGB，可显式传 color_order="rgb"。
+        默认将三通道图像视为 BGR 来源（OpenCV 常见读法）。如你的数据确认为 RGB，可显式传 color_order="rgb"。
         """
         import time
         import uuid as _uuid
@@ -423,7 +587,7 @@ class BigVisionDatabase:
         # 数组 -> 适合写 PNG 的 uint8（保持 HxW 或 HxWxC）
         def _prep_uint8(arr: _np.ndarray) -> _np.ndarray:
             a = _np.asarray(arr)
-            # 尝试把 (C,H,W) 变为 (H,W,C)
+            # (C,H,W) -> (H,W,C)
             if a.ndim == 3 and a.shape[0] in (1, 3) and a.shape[2] not in (1, 3):
                 a = _np.moveaxis(a, 0, 2)
             while a.ndim > 3:
@@ -446,7 +610,6 @@ class BigVisionDatabase:
                     return a[:, :, 0]
                 if a.shape[2] >= 3:
                     return a[:, :, :3]
-            # 其他奇怪形状 → 灰度回退
             return a.reshape(a.shape[0], a.shape[1]).astype(_np.uint8)
 
         # 写 PNG：优先 imageio，回退 cv2
@@ -455,14 +618,12 @@ class BigVisionDatabase:
             def _save_png(dst: Path, img: _np.ndarray) -> bool:
                 iio.imwrite(str(dst), img)
                 return True
-
             writer_backend = "imageio"  # 期望 RGB
         except Exception:
             try:
                 import cv2  # type: ignore
                 def _save_png(dst: Path, img: _np.ndarray) -> bool:
                     return bool(cv2.imwrite(str(dst), img))
-
                 writer_backend = "cv2"  # 期望 BGR
             except Exception:
                 raise RuntimeError("Neither imageio nor OpenCV is available to write PNG files.")
@@ -492,25 +653,21 @@ class BigVisionDatabase:
             if row is None:
                 continue
 
-            src_path = (root / row["uri"]).resolve()
+            src_path = (Path(self.database_root) / row["uri"]).resolve()
             alias = row["alias"] or row["modality"] or iid
             base = f"{idx:04d}_{alias}"
 
             # PNG
             if output in ("png", "both"):
                 try:
-                    arr = _np.load(src_path, allow_pickle=False)
+                    import numpy as _np2
+                    arr = _np2.load(src_path, allow_pickle=False)
                     img = _prep_uint8(arr)
-
-                    # 若是三通道：默认按 BGR 来源修正到目标写入后端的期望
-                    if isinstance(img, _np.ndarray) and img.ndim == 3 and img.shape[2] == 3:
+                    if isinstance(img, _np2.ndarray) and img.ndim == 3 and img.shape[2] == 3:
                         if writer_backend == "imageio" and color_order == "bgr":
-                            # imageio 期望 RGB，我们的来源是 BGR -> 交换
-                            img = img[:, :, ::-1]
+                            img = img[:, :, ::-1]  # BGR -> RGB
                         elif writer_backend == "cv2" and color_order == "rgb":
-                            # cv2 期望 BGR，我们的来源是 RGB -> 交换
-                            img = img[:, :, ::-1]
-
+                            img = img[:, :, ::-1]  # RGB -> BGR
                     dst_name = _safe_name(base, "png")
                     dst_path = out_dir_path / dst_name
                     if dst_path.exists() and not overwrite:
@@ -524,12 +681,13 @@ class BigVisionDatabase:
             # NPY
             if output in ("npy", "both"):
                 try:
+                    import shutil as _sh
                     dst_name = _safe_name(base, "npy")
                     dst_path = out_dir_path / dst_name
                     if dst_path.exists() and not overwrite:
                         pass
                     else:
-                        shutil.copy2(src_path, dst_path)
+                        _sh.copy2(src_path, dst_path)
                         exported_files.append(dst_path)
                 except Exception as e:
                     print(f"[WARN] NPY copy failed for image_id={iid}: {e}", file=sys.stderr)
@@ -550,15 +708,7 @@ class BigVisionDatabase:
                     zp.parent.mkdir(parents=True, exist_ok=True)
                     out_zip = zp
                     if out_zip.exists():
-                        if overwrite:
-                            out_zip.unlink()
-                        else:
-                            k = 1
-                            while True:
-                                cand = out_zip.with_name(out_zip.stem + f"_{k}").with_suffix(".zip")
-                                if not cand.exists():
-                                    out_zip = cand
-                                    break
+                        out_zip.unlink()
                     tmp_zip.replace(out_zip)
             else:
                 base = str(out_dir_path)
@@ -573,6 +723,28 @@ class BigVisionDatabase:
             "files": files_rel,
             "zip_path": (str(out_zip) if out_zip else None),
         }
+
+    # ---------------- helpers ----------------
+
+    @staticmethod
+    def _rows_to_df(rows: List[Tuple[Any, ...]], columns: List[str]):
+        import pandas as pd
+        return pd.DataFrame(rows, columns=columns)
+
+    # ---------------- 生命周期 ----------------
+
+    def close(self) -> None:
+        """关闭连接（可重复调用）"""
+        try:
+            self.conn.close()
+        except Exception:
+            pass
+
+    def __enter__(self) -> "BigVisionDatabase":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
 
 # ---------------- 直接可运行：无需传参 ----------------
@@ -599,44 +771,92 @@ if __name__ == "__main__":
             max_workers=workers,
             threads=0,               # 让 DuckDB 自己决定
         )
-        # 默认执行：从注册器写入
-        # db.ingest_from_registry(dry_run=False, show_progress=True)
-        # print("[OK] registry ingestion finished.")
 
-        # 可选：立刻做一次 GC（只报告，不删除），你可以根据需要删掉下面两行
-        # gc_summary = db.garbage_collect(remove_orphan_files=False, check_db_missing_files=True, verbose=True)
-        # print(f"[OK] GC summary: {gc_summary}")
-
+        # ------- DB 概览 -------
         summary = db.get_db_summary()
         print("[OK] DB Summary:")
         print(json.dumps(summary, ensure_ascii=False, indent=2))
 
+        # ------- 随机采样导出（示例） -------
         sample_n = 16
-        # 从 DB 随机抽样 image_id（若 DuckDB 版本不支持 TABLESAMPLE，可用 ORDER BY random()）
         rows = db.conn.execute(
             "SELECT image_id FROM images ORDER BY random() LIMIT ?;",
             [sample_n],
         ).fetchall()
         sample_ids = [r[0] for r in rows]
+        # if sample_ids:
+        #     export_res = db.export_images_by_ids(
+        #         sample_ids,
+        #         out_dir=None,
+        #         output="png",
+        #         normalize=True,
+        #         zip_output=True,
+        #         zip_path=None,
+        #         overwrite=True,
+        #         sample_limit=10,
+        #     )
+        #     print("[OK] Export test result:")
+        #     print(json.dumps(export_res, ensure_ascii=False, indent=2))
+        # else:
+        #     print("[INFO] No images found in DB; skip export test.")
 
+        # ------- Relations CRUD（dry_run 测试，不实际修改） -------
+        # 1) 构造一个新 relation 的 payload（使用随机采样的 image_ids）
         if not sample_ids:
-            print("[INFO] No images found in DB; skip export test.")
+            # 如果没有图片，跳过 CRUD 测试
+            print("[INFO] Skip relation CRUD dry-run tests (no images).")
         else:
-            export_res = db.export_images_by_ids(
-                sample_ids,
-                out_dir=None,  # 自动生成 tmp/exports/<ts>-<rand>/
-                output="png",  # 导出 PNG 供直观看图
-                normalize=True,  # 归一化到 8-bit
-                zip_output=True,  # 额外打包 zip
-                zip_path=None,  # 默认 zip 到导出目录同名
-                overwrite=True,
-                sample_limit=10,
-            )
-            print("[OK] Export test result:")
-            print(json.dumps(export_res, ensure_ascii=False, indent=2))
+            new_payload = {
+                "task_type": "demo",
+                "annotation": {"note": "dry-run create test"},
+                "image_ids": sample_ids[: min(3, len(sample_ids))],  # 取前 3 张
+            }
+            print("\n[TEST] add_relation (dry_run)")
+            add_res = db.add_relation(payload=new_payload, protocols=["demo_proto", "debug_view"], dry_run=True)
+            print(json.dumps(add_res, ensure_ascii=False, indent=2))
+
+            # 2) 挑选一条已存在的 relation 做 query/update/delete（dry_run）
+            exist_row = db.conn.execute("SELECT relation_id, payload FROM relations LIMIT 1").fetchone()
+            if exist_row:
+                exist_rid = exist_row[0]
+                print("\n[TEST] get_relation")
+                got = db.get_relation(exist_rid)
+                print(json.dumps(got, ensure_ascii=False, indent=2))
+
+                print("\n[TEST] update_relation (dry_run)")
+                # 替换 payload：在原 payload 基础上添加一个字段（不去真正读出再写，纯演示）
+                upd_payload = {
+                    "task_type": "updated_demo",
+                    "annotation": {"note": "dry-run update"},
+                    "image_ids": sample_ids[: min(2, len(sample_ids))],  # 换一组 id 测试校验
+                }
+                upd_res = db.update_relation(
+                    exist_rid,
+                    payload=upd_payload,
+                    add_protocols=["extra_proto"],
+                    remove_protocols=["debug_view"],  # 即便不存在也不报错
+                    dry_run=True,
+                )
+                print(json.dumps(upd_res, ensure_ascii=False, indent=2))
+
+                print("\n[TEST] delete_relation (dry_run)")
+                del_res = db.delete_relation(exist_rid, dry_run=True)
+                print(json.dumps(del_res, ensure_ascii=False, indent=2))
+            else:
+                print("[INFO] No existing relations to test update/delete.")
+
+            # 3) 列出某个 protocol 下的 relations
+            proto_row = db.conn.execute("SELECT DISTINCT protocol_name FROM protocol LIMIT 1").fetchone()
+            if proto_row:
+                pname = proto_row[0]
+                print(f"\n[TEST] list_relations_by_protocol('{pname}')")
+                lst = db.list_relations_by_protocol(pname, limit=5, offset=0)
+                print(json.dumps(lst, ensure_ascii=False, indent=2))
+            else:
+                print("[INFO] No protocol found to list relations.")
 
     except Exception as e:
-        print(f"[ERROR] ingestion failed: {e}", file=sys.stderr)
+        print(f"[ERROR] run failed: {e}", file=sys.stderr)
         traceback.print_exc()
         sys.exit(1)
     finally:
