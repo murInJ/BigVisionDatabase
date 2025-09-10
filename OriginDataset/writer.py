@@ -308,7 +308,7 @@ def _build_relation_rows(
     for rel_name, rel in relations.items():
         rid = uuid.uuid4().hex
         body = dict(rel)
-        names = body.pop("image_names", None)
+        names = body.get("image_names", None)
         names = list(names) if names is not None else []
         image_ids = _map_names_to_ids(names, key_to_id, alias_to_id, all_ids_in_order)
         body["image_ids"] = image_ids
