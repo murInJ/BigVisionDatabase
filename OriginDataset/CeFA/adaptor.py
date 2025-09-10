@@ -3,15 +3,15 @@ from torch.utils.data import ConcatDataset
 from tqdm import tqdm
 
 from Config.setting import GetOrigindataConfig
-from OriginDataset.SURF.loadDataset import SURF_Origin_Dataset
+from OriginDataset.CeFA.loadDataset import CeFA_Origin_Dataset
 from OriginDataset.base import BaseAdaptor
 
-__plugin_name__ = "SURF"
+__plugin_name__ = "CeFA"
 
 class Adaptor(BaseAdaptor):
     def __init__(self):
         config = GetOrigindataConfig()
-        self.dataset = ConcatDataset([SURF_Origin_Dataset(config=config, split="train"), SURF_Origin_Dataset(config=config, split="test")])
+        self.dataset = ConcatDataset([CeFA_Origin_Dataset(config=config, split="train"), CeFA_Origin_Dataset(config=config, split="test")])
 
     def __getitem__(self, idx):
         data = self.dataset[idx]
@@ -45,7 +45,7 @@ class Adaptor(BaseAdaptor):
             }
         }
         protocol = {
-            "SURF_train" if data["split"] == "train" else "SURF_test" : ["FAS"]
+            "CeFA_train" if data["split"] == "train" else "CeFA_test" : ["FAS"]
         }
         adapted_data = {
             'images': images,
@@ -57,7 +57,7 @@ class Adaptor(BaseAdaptor):
 
 if __name__ == '__main__':
     config = GetOrigindataConfig()
-    dataset = SURF_Origin_Dataset(config=config, split="train")
+    dataset = CeFA_Origin_Dataset(config=config, split="train")
     print(len(dataset))
     dataloader = torch.utils.data.DataLoader(dataset=dataset)
     for idx, sample in tqdm(enumerate(dataloader),total=len(dataloader)):

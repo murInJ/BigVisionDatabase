@@ -1,298 +1,347 @@
-import os
-import uuid
+# OriginDataset/writer.py
+from __future__ import annotations
+
 import json
-import traceback
+import uuid
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Dict, Tuple, List
+from typing import Any, Dict, List
 
-import cv2
+import numpy as np
 import pandas as pd
 
 try:
-    # Support both package and flat script layouts
-    from .utils_duckdb import ensure_dir, rm_tree, move_to_quarantine, atomic_replace_dir, require_duckdb  # type: ignore
+    from OriginDataset.utils import ensure_dir
 except Exception:  # pragma: no cover
-    from utils_duckdb import ensure_dir, rm_tree, move_to_quarantine, atomic_replace_dir, require_duckdb  # type: ignore
+    from utils import ensure_dir  # type: ignore
 
-from Config.setting import GetDatabaseConfig
+# 注册器
+
 from OriginDataset.base import BaseAdaptor
-from registry import discover_and_register, REGISTRY
+from OriginDataset.registry import discover_and_register, REGISTRY
+
 
 
 class DatasetWriter:
-    """High-performance dataset writer storing *all metadata in DuckDB*.
-
-    Storage layout under `database_root`:
-      images/<dataset>/UUID.jpg
-      db/catalog.duckdb  (relations & protocol_entries are stored here)
+    """
+    仅负责“写入”；不创建连接/不初始化 schema。
+    由调用方传入 DuckDB 连接（BigVisionDatabase 管理）。
     """
 
     def __init__(
         self,
+        *,
+        conn,  # duckdb.DuckDBPyConnection
         database_root: str,
-        duckdb_path: str | None = None,
         max_workers: int = 8,
     ) -> None:
+        self.conn = conn
         self.root = Path(database_root)
         self.images_root = self.root / "images"
-        self.db_root = self.root / "db"
-        self.trash_root = self.root / ".trash"
-        self.max_workers = max_workers
+        ensure_dir(self.images_root)
+        self.max_workers = max(1, int(max_workers))
 
-        for p in [self.root, self.images_root, self.db_root, self.trash_root]:
-            ensure_dir(p)
-
-        threads = max(1, os.cpu_count() or 4)
-        db_path = duckdb_path or str(self.db_root / "catalog.duckdb")
-        self.conn = require_duckdb(db_path, threads)
-        self._init_duckdb_schema()
-
-    # -----------------------
-    # Schema & DB helpers
-    # -----------------------
-
-    def _init_duckdb_schema(self) -> None:
-        # Relations table
-        self.conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS relations (
-                relation_id TEXT PRIMARY KEY,
-                dataset_name TEXT NOT NULL,
-                payload JSON NOT NULL
-            );
-            """
-        )
-        # Protocol mapping table
-        self.conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS protocol_entries (
-                protocol_name TEXT NOT NULL,
-                relation_id TEXT NOT NULL,
-                relation_set TEXT NOT NULL
-            );
-            """
-        )
-        # Helpful indexes
-        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_relations_dataset ON relations(dataset_name);")
-        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_protocols_set ON protocol_entries(relation_set);")
-        self.conn.execute("CREATE INDEX IF NOT EXISTS idx_protocols_name ON protocol_entries(protocol_name);")
-
-    # -----------------------
-    # Public API
-    # -----------------------
+    # ---------------- 公共 API ----------------
 
     def write_dataset(
         self,
-        dataset_name: str,
-        images: Dict[str, "cv2.Mat"],
-        relations: Dict[str, Dict],
-        protocols: Dict[str, List[str]],
+        images: Dict[str, Any],               # {key|alias: {'image': ndarray/tensor, 'dataset_name': str, 'modality'?: str, 'alias'?: str, 'extra'?: dict}}
+        relations: Dict[str, Dict[str, Any]], # {relation_name: {'image_names'?: [...], 其它业务键...}}
+        protocols: Dict[str, List[str]],      # {protocol_name(or relation_set): [relation_name, ...]}
         *,
-        force_rewrite: bool = False,
         dry_run: bool = False,
-    ) -> None:
-        """Write one dataset (images + relations + protocols). Always uses DuckDB.
-
-        If `force_rewrite` is True, safely remove any existing data for this dataset before writing.
+    ) -> Dict[str, int]:
         """
-        # Short-circuit if dataset already exists and not forcing rewrite
-        if not force_rewrite and self._dataset_exists(dataset_name):
-            msg = (
-                f"[DRY-RUN] Would skip existing dataset '{dataset_name}'. Use force_rewrite=True to overwrite."
-                if dry_run
-                else f"[SKIP] Dataset '{dataset_name}' already exists. Use force_rewrite=True to overwrite."
-            )
-            print(msg)
-            return
+        写入单个 adaptor item；返回 {'imgs': X, 'rels': Y, 'proto': Z}
+        """
+        # 0) 预创建目录
+        keys_order = list(images.keys())
+        for k in keys_order:
+            ds = _per_image_dataset_name(images[k])
+            ensure_dir(self.images_root / ds)
 
-        dataset_images_final = self.images_root / dataset_name
-        dataset_images_tmp = self.images_root / f"{dataset_name}__tmp-{uuid.uuid4().hex[:8]}"
+        # 1) 写图片
+        key_meta = self._write_images_concurrently(images) if not dry_run else _fake_meta(images)
 
-        quarantine_dir = None
+        key_to_id   = {k: m["image_id"] for k, m in key_meta.items()}
+        alias_to_id = {m.get("alias", k): m["image_id"] for k, m in key_meta.items()}
 
-        # 1) If forcing rewrite, quarantine existing directory and purge DB rows
-        if force_rewrite:
-            if dry_run:
-                print(f"[DRY-RUN] Would quarantine & delete dataset '{dataset_name}'.")
-            else:
-                quarantine_dir = move_to_quarantine(dataset_images_final, self.trash_root)
-                self._delete_dataset_rows(dataset_name)
+        # 2) 组装 DF
+        images_df = _build_images_rows(key_meta)
+        rel_df    = _build_relation_rows(relations, keys_order, key_to_id, alias_to_id)
+        proto_df  = _build_protocol_rows(protocols, rel_df)
 
-        # 2) Write images concurrently into a temp dir
-        if dry_run:
-            print(f"[DRY-RUN] Would write {len(images)} images for dataset '{dataset_name}'.")
-            image_name_uuid_map = {k: uuid.uuid4().hex for k in images.keys()}
-        else:
-            image_name_uuid_map = self._write_images_concurrently(dataset_images_tmp, images)
-
-        # 3) Materialize DataFrames for bulk insert
-        rel_df, relation_name_uuid_map = self._build_relation_rows(dataset_name, relations, image_name_uuid_map)
-        proto_df = self._build_protocol_rows(dataset_name, protocols, relation_name_uuid_map)
-
-        # 4) Persist metadata transactionally into DuckDB
-        if dry_run:
-            print(f"[DRY-RUN] Would insert {len(rel_df)} relations and {len(proto_df)} protocol rows.")
-        else:
-            self._persist_metadata(rel_df, proto_df)
-
-        # 5) Atomically swap image directory into place
+        # 3) 事务持久化
         if not dry_run:
-            ensure_dir(dataset_images_tmp)
-            atomic_replace_dir(dataset_images_tmp, dataset_images_final)
-            if quarantine_dir and Path(quarantine_dir).exists():
-                rm_tree(Path(quarantine_dir))
+            self._persist_metadata(images_df, rel_df, proto_df)
 
-    def write_from_registry(self, *, force_rewrite: bool = False, dry_run: bool = False) -> None:
+        return {
+            "imgs": len(images_df),
+            "rels": len(rel_df),
+            "proto": len(proto_df),
+        }
+
+    def write_from_registry(self, *, dry_run: bool = False, show_progress: bool = True) -> None:
+        """
+        扫描并运行各 adaptor，将数据写入。
+        进度显示（每 adaptor 一条 tqdm）在此方法内部处理，避免刷屏。
+        """
+        try:
+            from tqdm import tqdm  # 局部依赖，可选安装
+        except Exception:
+            tqdm = None  # type: ignore
+
         discover_and_register(
             root_package="OriginDataset",
             target_filename="adaptor.py",
             class_name="Adaptor",
             base_class=BaseAdaptor,
         )
+
         for name, adaptor_cls in REGISTRY.items():
             adaptor = adaptor_cls()
-            for idx, data in enumerate(adaptor):
-                try:
-                    images: Dict[str, "cv2.Mat"] = data["images"]
-                    relations: Dict[str, Dict] = data["relation"]
-                    protocols: Dict[str, List[str]] = data["protocol"]
+            label = getattr(adaptor_cls, "__plugin_name__", name)
+            total = _estimate_total(adaptor) if show_progress else None
 
-                    self.write_dataset(
-                        dataset_name=name,
-                        images=images,
-                        relations=relations,
-                        protocols=protocols,
-                        force_rewrite=force_rewrite,
-                        dry_run=dry_run,
-                    )
-                except Exception as e:
-                    print(f"[ERROR] Failed to write dataset '{name}' (item #{idx}): {e}\n{traceback.format_exc()}")
+            pbar = None
+            if tqdm and show_progress:
+                pbar = tqdm(total=total, desc=label, unit="item", dynamic_ncols=True, leave=True)
 
-    # -----------------------
-    # Internal helpers
-    # -----------------------
+            agg = {"imgs": 0, "rels": 0, "proto": 0, "err": 0}
+            try:
+                for _idx, data in enumerate(adaptor):
+                    try:
+                        s = self.write_dataset(
+                            images=data["images"],
+                            relations=data["relation"],
+                            protocols=data["protocol"],
+                            dry_run=dry_run,
+                        )
+                        agg["imgs"]  += s.get("imgs", 0)
+                        agg["rels"]  += s.get("rels", 0)
+                        agg["proto"] += s.get("proto", 0)
+                    except Exception:
+                        agg["err"] += 1
+                    finally:
+                        if pbar:
+                            pbar.update(1)
+                            pbar.set_postfix(imgs=agg["imgs"], rels=agg["rels"], proto=agg["proto"], err=agg["err"], refresh=False)
+            finally:
+                if pbar:
+                    pbar.close()
 
-    def _dataset_exists(self, dataset_name: str) -> bool:
-        """Return True if the dataset appears to have been written already.
+    # ---------------- 内部：写图片 ----------------
 
-        We consider it existing if either:
-          - DuckDB has rows in `relations` for this dataset, OR
-          - images/<dataset>/ contains any files (to catch orphaned image dirs)
-        """
-        count = self.conn.execute(
-            "SELECT count(*) FROM relations WHERE dataset_name = ?;",
-            [dataset_name],
-        ).fetchone()[0]
-        if count and int(count) > 0:
-            return True
-        img_dir = self.images_root / dataset_name
-        try:
-            has_images = img_dir.exists() and any(img_dir.iterdir())
-        except Exception:
-            has_images = img_dir.exists()
-        return has_images
-
-    def _delete_dataset_rows(self, dataset_name: str) -> None:
-        self.conn.execute("BEGIN TRANSACTION;")
-        try:
-            self.conn.execute("DELETE FROM protocol_entries WHERE relation_set = ?;", [dataset_name])
-            self.conn.execute("DELETE FROM relations WHERE dataset_name = ?;", [dataset_name])
-            self.conn.execute("COMMIT;")
-        except Exception:
-            self.conn.execute("ROLLBACK;")
-            raise
-
-    def _write_images_concurrently(self, tmp_dir: Path, images: Dict[str, "cv2.Mat"]) -> Dict[str, str]:
-        ensure_dir(tmp_dir)
+    def _write_images_concurrently(
+        self,
+        images: Dict[str, Any],
+    ) -> Dict[str, Dict[str, Any]]:
+        written_files: List[Path] = []
 
         def _write_one(item):
-            name, img = item
-            img_uuid = uuid.uuid4().hex
-            out = tmp_dir / f"{img_uuid}.jpg"
-            ok = cv2.imwrite(str(out), img)
-            if not ok:
-                raise RuntimeError(f"cv2.imwrite failed for {out}")
-            return name, img_uuid
+            key, val = item
+            arr = _as_ndarray(val)
+            ds = _per_image_dataset_name(val)
+            out_dir = self.images_root / ds
+            ensure_dir(out_dir)
 
-        name_uuid_map: Dict[str, str] = {}
+            image_uuid = uuid.uuid4().hex
+            out_path = out_dir / f"{image_uuid}.npy"
+            np.save(out_path, arr)
+            written_files.append(out_path)
+
+            uri = f"images/{ds}/{image_uuid}.npy"
+            return key, {
+                "image_id":     image_uuid,
+                "uri":          uri,
+                "modality":     _modality_from(key, val),
+                "dataset_name": ds,
+                "alias":        _alias_from(key, val),
+                "extra":        _extra_from(val),
+            }
+
+        key_meta: Dict[str, Dict[str, Any]] = {}
         errors: List[str] = []
         with ThreadPoolExecutor(max_workers=self.max_workers) as ex:
             futures = [ex.submit(_write_one, kv) for kv in images.items()]
             for fut in as_completed(futures):
                 try:
-                    name, img_uuid = fut.result()
-                    name_uuid_map[name] = img_uuid
+                    key, row = fut.result()
+                    key_meta[key] = row
                 except Exception as e:
                     errors.append(str(e))
+
         if errors:
-            rm_tree(tmp_dir)
-            raise RuntimeError("One or more image writes failed: \n" + "\n".join(errors))
-        return name_uuid_map
+            # best-effort 清理
+            for p in written_files:
+                try:
+                    if p.exists():
+                        p.unlink()
+                except Exception:
+                    pass
+            raise RuntimeError("One or more image writes failed:\n" + "\n".join(errors))
+        return key_meta
 
-    def _build_relation_rows(
+    # ---------------- 内部：持久化 ----------------
+
+    def _persist_metadata(
         self,
-        dataset_name: str,
-        relations: Dict[str, Dict],
-        image_name_uuid_map: Dict[str, str],
-    ) -> Tuple[pd.DataFrame, Dict[str, str]]:
-        rows = []
-        rel_name_to_uuid: Dict[str, str] = {}
-        for rel_name, rel in relations.items():
-            rid = uuid.uuid4().hex
-            rel = dict(rel)  # avoid mutating caller data
-            if "image_names" in rel:
-                rel["image_ids"] = [image_name_uuid_map[name] for name in rel["image_names"]]
-                rel.pop("image_names", None)
-            payload = json.dumps(rel, ensure_ascii=False, sort_keys=True)
-            rows.append({"relation_id": rid, "dataset_name": dataset_name, "payload": payload})
-            rel_name_to_uuid[rel_name] = rid
-        df = pd.DataFrame(rows, columns=["relation_id", "dataset_name", "payload"])
-        return df, rel_name_to_uuid
+        images_df: pd.DataFrame,
+        rel_df: pd.DataFrame,
+        proto_df: pd.DataFrame,
+    ) -> None:
+        # relations DF 含 __rel_name（用于构造 protocol），落库前移除
+        rel_insert_df = rel_df.drop(columns=["__rel_name"]) if "__rel_name" in rel_df.columns else rel_df
 
-    def _build_protocol_rows(
-        self,
-        dataset_name: str,
-        protocols: Dict[str, List[str]],
-        relation_name_uuid_map: Dict[str, str],
-    ) -> pd.DataFrame:
-        rows = []
-        for proto_name, rel_names in protocols.items():
-            for rn in rel_names:
-                rid = relation_name_uuid_map[rn]
-                rows.append({
-                    "protocol_name": proto_name,
-                    "relation_id": rid,
-                    "relation_set": dataset_name,
-                })
-        return pd.DataFrame(rows, columns=["protocol_name", "relation_id", "relation_set"])
-
-    def _persist_metadata(self, rel_df: pd.DataFrame, proto_df: pd.DataFrame) -> None:
-        self.conn.execute("BEGIN TRANSACTION;")
+        self.conn.execute("BEGIN;")
         try:
-            self.conn.register("rel_df", rel_df)
-            self.conn.register("proto_df", proto_df)
+            if not images_df.empty:
+                self.conn.register("images_df", images_df)
+                self.conn.execute("INSERT INTO images SELECT * FROM images_df;")
+
+            self.conn.register("rel_df", rel_insert_df)
             self.conn.execute("INSERT INTO relations SELECT * FROM rel_df;")
+
             if not proto_df.empty:
-                self.conn.execute("INSERT INTO protocol_entries SELECT * FROM proto_df;")
+                self.conn.register("proto_df", proto_df)
+                self.conn.execute("INSERT INTO protocol SELECT * FROM proto_df;")
+
             self.conn.execute("COMMIT;")
         except Exception:
             self.conn.execute("ROLLBACK;")
             raise
 
 
-# --------------------------------------
-# Backwards-compatible entry point
-# --------------------------------------
+# ---------------- 辅助方法（与 DB 解耦） ----------------
 
-def write(config: dict, *, force_rewrite: bool = False, dry_run: bool = False, max_workers: int = 8) -> None:
-    writer = DatasetWriter(
-        database_root=config["database_root"],
-        max_workers=max_workers,
-    )
-    writer.write_from_registry(force_rewrite=force_rewrite, dry_run=dry_run)
+def _as_ndarray(val: Any) -> np.ndarray:
+    if not isinstance(val, dict) or "image" not in val:
+        raise ValueError("Each images[...] value must be a dict with an 'image' field.")
+    img = val["image"]
+    try:
+        import torch  # type: ignore
+        if hasattr(img, "detach") and hasattr(img, "cpu") and hasattr(img, "numpy"):
+            img = img.detach().cpu().numpy()
+    except Exception:
+        pass
+    return np.asarray(img)
 
+def _per_image_dataset_name(val: Any) -> str:
+    if not isinstance(val, dict) or not val.get("dataset_name"):
+        raise ValueError("Each images[...] value must provide 'dataset_name'.")
+    return str(val["dataset_name"])
 
-if __name__ == "__main__":
-    cfg = GetDatabaseConfig()
-    write(cfg, force_rewrite=True, dry_run=False, max_workers=max(8, (os.cpu_count() or 8)))
+def _modality_from(key: str, val: Any) -> str:
+    if isinstance(val, dict) and val.get("modality"):
+        return str(val["modality"])
+    return str(key)
+
+def _alias_from(key: str, val: Any) -> str:
+    if isinstance(val, dict) and val.get("alias"):
+        return str(val["alias"])
+    return str(key)
+
+def _extra_from(val: Any) -> str:
+    extra_obj: Dict[str, Any] = {}
+    if isinstance(val, dict) and isinstance(val.get("extra"), dict):
+        extra_obj.update(val["extra"])
+    return json.dumps(extra_obj, ensure_ascii=False, sort_keys=True)
+
+def _fake_meta(images: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """
+    dry_run 模式下的元信息构造：不落盘，仅模拟 image_id/uri 等字段。
+    """
+    key_meta: Dict[str, Dict[str, Any]] = {}
+    for key, val in images.items():
+        ds = _per_image_dataset_name(val)
+        img_id = uuid.uuid4().hex
+        key_meta[key] = {
+            "image_id":     img_id,
+            "uri":          f"images/{ds}/{img_id}.npy",
+            "modality":     _modality_from(key, val),
+            "dataset_name": ds,
+            "alias":        _alias_from(key, val),
+            "extra":        _extra_from(val),
+        }
+    return key_meta
+
+def _build_images_rows(key_meta: Dict[str, Dict[str, Any]]) -> pd.DataFrame:
+    rows = []
+    for _k, m in key_meta.items():
+        rows.append({
+            "image_id":     m["image_id"],
+            "uri":          m["uri"],
+            "modality":     m.get("modality"),
+            "dataset_name": m.get("dataset_name"),
+            "alias":        m.get("alias"),
+            "extra":        m.get("extra", json.dumps({}, ensure_ascii=False, sort_keys=True)),
+        })
+    return pd.DataFrame(rows, columns=["image_id", "uri", "modality", "dataset_name", "alias", "extra"])
+
+def _map_names_to_ids(
+    names: List[str],
+    key_to_id: Dict[str, str],
+    alias_to_id: Dict[str, str],
+    fallback_all_ids: List[str],
+) -> List[str]:
+    if not names:
+        return list(fallback_all_ids)
+    ids: List[str] = []
+    for n in names:
+        if n in key_to_id:
+            ids.append(key_to_id[n])
+        elif n in alias_to_id:
+            ids.append(alias_to_id[n])
+        else:
+            raise ValueError(f"relation references unknown image name/alias: '{n}'")
+    return ids
+
+def _build_relation_rows(
+    relations: Dict[str, Dict[str, Any]],
+    keys_order: List[str],
+    key_to_id: Dict[str, str],
+    alias_to_id: Dict[str, str],
+) -> pd.DataFrame:
+    """将 relation.image_names（可为键名或 alias）映射为 image_ids；未提供则用全部 images（按 keys_order 保序）"""
+    all_ids_in_order = [key_to_id[k] for k in keys_order]
+    rows = []
+    for rel_name, rel in relations.items():
+        rid = uuid.uuid4().hex
+        body = dict(rel)
+        names = body.pop("image_names", None)
+        names = list(names) if names is not None else []
+        image_ids = _map_names_to_ids(names, key_to_id, alias_to_id, all_ids_in_order)
+        body["image_ids"] = image_ids
+
+        payload = json.dumps(body, ensure_ascii=False, sort_keys=True)
+        rows.append({"relation_id": rid, "payload": payload, "__rel_name": rel_name})
+    return pd.DataFrame(rows, columns=["relation_id", "payload", "__rel_name"])
+
+def _build_protocol_rows(
+    protocols: Dict[str, List[str]],
+    rel_df: pd.DataFrame,
+) -> pd.DataFrame:
+    name_to_id = {row["__rel_name"]: row["relation_id"] for _, row in rel_df.iterrows()}
+    rows = []
+    for relation_set, rel_names in protocols.items():
+        for rn in rel_names:
+            rid = name_to_id[rn]
+            rows.append({
+                "protocol_name": relation_set,
+                "relation_id":   rid,
+                "relation_set":  relation_set,
+            })
+    return pd.DataFrame(rows, columns=["protocol_name", "relation_id", "relation_set"])
+
+def _estimate_total(adaptor: Any) -> int | None:
+    try:
+        return len(adaptor)
+    except Exception:
+        pass
+    ds = getattr(adaptor, "dataset", None)
+    if ds is not None:
+        try:
+            return len(ds)
+        except Exception:
+            pass
+    return None

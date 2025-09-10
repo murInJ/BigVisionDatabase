@@ -16,9 +16,24 @@ class Adaptor(BaseAdaptor):
     def __getitem__(self, idx):
         data = self.dataset[idx]
         images = {
-            "RGB": data['images']["RGB"]["image"],
-            "DEPTH": data['images']["DEPTH"]["image"],
-            "IR": data['images']["IR"]["image"],
+            "RGB":   {
+                "image": data["images"]["RGB"]["image"],
+                "dataset_name": data["dataset"],
+                "modality": "RGB",
+                "extra":{}
+            },
+            "DEPTH": {
+                "image": data["images"]["DEPTH"]["image"],
+                "dataset_name": data["dataset"],
+                "modality": "DEPTH",
+                "extra":{}
+            },
+            "IR":    {
+                "image": data["images"]["IR"]["image"],
+                "dataset_name": data["dataset"],
+                "modality": "IR",
+                "extra":{}
+            },
         }
         relation = {
             "FAS":{
@@ -26,7 +41,6 @@ class Adaptor(BaseAdaptor):
                 "task_type": "classification",
                 "annotation": {
                     "label": data["label"],
-                    "dataset": data["dataset"],
                 }
             }
         }
