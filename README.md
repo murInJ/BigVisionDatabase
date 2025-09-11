@@ -3,7 +3,7 @@
 [![DuckDB](https://img.shields.io/badge/DuckDB-%F0%9F%A6%85-ffcc00)](https://duckdb.org/)
 [![License](https://img.shields.io/badge/license-Apache--2.0-green)](#license)
 ## Version
-0.0.3
+0.1.2
 ## Update Plan
 None
 
