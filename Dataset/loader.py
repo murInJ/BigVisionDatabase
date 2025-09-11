@@ -314,63 +314,91 @@ class DBProtocolDataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         s = self._samples[idx]
-        imgs: List[Any] = []
-        aliases: List[Optional[str]] = []
-        modalities: List[Optional[str]] = []
+
+        images_dict: Dict[str, Any] = {}
+        modalities_dict: Dict[str, Optional[str]] = {}
+        datasets_dict: Dict[str, str] = {}
+        image_ids_dict: Dict[str, str] = {}
+        uris_dict: Dict[str, Optional[str]] = {}
+
+        # 为了避免别名冲突
+        used_aliases: set = set()
 
         for i, iid in enumerate(s.image_ids):
             meta = self._imgmeta.get(iid)
             if meta is None:
                 if self.strict:
                     raise KeyError(f"image_id not found in images table: {iid}")
-                else:
-                    warnings.warn(f"Missing image row for {iid}; substituting zeros")
-                    # Try best-effort zeros with unknown shape
-                    imgs.append(self._zeros_like_unknown())
-                    aliases.append(None)
-                    modalities.append(None)
-                    continue
+                warnings.warn(f"Missing image row for {iid}; substituting zeros")
+                arr = self._zeros_like_unknown()
+                alias = f"img{i}"
+                # 保证唯一
+                suffix = 1
+                base = alias
+                while alias in used_aliases:
+                    alias = f"{base}_{suffix}"
+                    suffix += 1
+                used_aliases.add(alias)
 
+                images_dict[alias] = self._to_tensor(arr) if self.to_tensor else arr
+                modalities_dict[alias] = None
+                datasets_dict[alias] = "unknown"
+                image_ids_dict[alias] = iid
+                uris_dict[alias] = None
+                continue
+
+            # 读取图
             path = meta.npy_path(self.db_root)
             arr = self._load_npy(path)
-
-            # Color handling
-            arr = self._apply_color(arr)  # may flip channels; guarantees contiguous if flipped
-
-            # Normalize / dtype
+            arr = self._apply_color(arr)
             arr = self._maybe_normalize(arr)
-
-            # to tensor if requested
             if self.to_tensor:
                 arr = self._to_tensor(arr)
-
-            # per-image transform
             if self.image_transform is not None:
                 arr = self.image_transform(arr)
 
-            imgs.append(arr)
-
-            # resolve alias priority for observation only (export rules are for Compact)
-            alias = None
-            if s.image_aliases and i < len(s.image_aliases):
-                alias = s.image_aliases[i]
-            elif s.image_names and i < len(s.image_names):
-                alias = s.image_names[i]
+            # 解析 alias（多级兜底 + 去重）
+            if s.image_aliases and i < len(s.image_aliases) and s.image_aliases[i]:
+                alias = str(s.image_aliases[i])
+            elif s.image_names and i < len(s.image_names) and s.image_names[i]:
+                alias = str(s.image_names[i])
             elif meta.alias:
-                alias = meta.alias
+                alias = str(meta.alias)
+            elif meta.uri:  # 新增：从 uri 提取文件名（不含后缀）
+                import os as _os
+                alias = _os.path.splitext(_os.path.basename(meta.uri))[0]
             elif meta.modality:
-                alias = meta.modality
+                alias = str(meta.modality)
             else:
                 alias = f"img{i}"
-            aliases.append(alias)
-            modalities.append(meta.modality)
+
+            # 保证 alias 唯一
+            if alias in used_aliases:
+                # 尽量用短 image_id 后缀保持可读性
+                short = (iid[:8] if isinstance(iid, str) else str(i))
+                cand = f"{alias}_{short}"
+                k = 1
+                while cand in used_aliases:
+                    cand = f"{alias}_{short}_{k}"
+                    k += 1
+                alias = cand
+            used_aliases.add(alias)
+
+            # 写入字典
+            images_dict[alias] = arr
+            modalities_dict[alias] = meta.modality
+            datasets_dict[alias] = meta.dataset_name
+            image_ids_dict[alias] = iid
+            uris_dict[alias] = meta.uri
 
         sample = {
             'relation_id': s.relation_id,
-            'images': imgs,
-            'image_ids': list(s.image_ids),
-            'aliases': aliases,
-            'modalities': modalities,
+            'images': images_dict,  # <- 现在是 dict[alias -> image]
+            # 为了易用性，这些也都改成按 alias 的 dict：
+            'image_ids': image_ids_dict,  # dict[alias -> image_id]
+            'modalities': modalities_dict,  # dict[alias -> modality or None]
+            'datasets': datasets_dict,  # dict[alias -> dataset_name]
+            'uris': uris_dict,  # dict[alias -> uri or None]
             'payload': s.payload,
         }
 
@@ -458,44 +486,53 @@ class DBProtocolDataset(Dataset):
     # -----------------------------
     @staticmethod
     def collate_batch(samples: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """A flexible collate_fn that tolerates variable #images per relation.
-
-        - If all samples have the same #images AND same image shapes, images are
-          stacked along a new batch dimension (B, ...).
-        - Otherwise, images remain a list per sample.
-        - Metadata fields are batched as lists.
+        """
+        Collate for dict-based samples:
+        - Union all alias keys across batch.
+        - If an alias exists in all samples and (when Tensor) shapes match, stack into (B, ...).
+          Otherwise, keep a list of length B (missing entries as None).
+        - Metadata dicts keyed by alias are merged shallowly into a dict[alias -> List/stack].
         """
         if not samples:
             return {}
 
-        # detect consistent shapes
-        def img_shapes(s):
-            return [tuple(getattr(img, 'shape', None) or getattr(img, 'size', None)) for img in s['images']]
+        TORCH = TORCH_AVAILABLE
 
-        same_count = len({len(s['images']) for s in samples}) == 1
-        can_stack = False
-        if same_count:
-            shapes0 = img_shapes(samples[0])
-            can_stack = all(img_shapes(s) == shapes0 for s in samples)
-
+        # 1) 基础元信息（逐样本列表）
         batch: Dict[str, Any] = {
             'relation_id': [s['relation_id'] for s in samples],
-            'image_ids': [s['image_ids'] for s in samples],
-            'aliases': [s['aliases'] for s in samples],
-            'modalities': [s['modalities'] for s in samples],
-            'payload': [s['payload'] for s in samples],
+            'payload': [s.get('payload') for s in samples],
         }
 
-        if can_stack and TORCH_AVAILABLE and isinstance(samples[0]['images'][0], torch.Tensor):
-            # stack per position, then stack across batch -> List[Tensor] of length K
-            k = len(samples[0]['images'])
-            images_per_pos: List[List[torch.Tensor]] = [[] for _ in range(k)]
-            for s in samples:
-                for i, img in enumerate(s['images']):
-                    images_per_pos[i].append(img)
-            batch['images'] = [torch.stack(images_per_pos[i], dim=0) for i in range(k)]
-        else:
-            batch['images'] = [s['images'] for s in samples]
+        # 2) 统计所有 alias
+        all_aliases = set()
+        for s in samples:
+            all_aliases.update(s['images'].keys())
+        all_aliases = sorted(all_aliases)
+
+        # 3) 合并 images：尽量 stack，否则 list
+        images_out: Dict[str, Any] = {}
+        for a in all_aliases:
+            per = [s['images'].get(a, None) for s in samples]
+            # 判断是否都存在、且是 Tensor、且形状一致
+            can_stack = (
+                    TORCH and
+                    all((p is not None and hasattr(p, 'shape') and isinstance(p, torch.Tensor)) for p in per)
+            )
+            if can_stack:
+                shapes = [tuple(p.shape) for p in per]  # type: ignore
+                can_stack = len(set(shapes)) == 1
+            images_out[a] = (torch.stack(per, dim=0) if can_stack else per)
+        batch['images'] = images_out
+
+        # 4) 其它别名对齐的字典（modalities/datasets/image_ids/uris）
+        for key in ('modalities', 'datasets', 'image_ids', 'uris'):
+            merged: Dict[str, Any] = {}
+            for a in all_aliases:
+                per = [s.get(key, {}).get(a, None) for s in samples]
+                # 这些通常是标量/字符串，保持列表即可
+                merged[a] = per
+            batch[key] = merged
 
         return batch
 
