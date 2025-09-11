@@ -2,16 +2,14 @@
 from __future__ import annotations
 
 import json
-import json as _json
 import shutil
 import sys
 import time
 import traceback
 import uuid
-from pathlib import Path as _Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
-import numpy as _np
+import pandas as pd
 
 try:
     # 项目内导入（推荐）
@@ -273,7 +271,6 @@ class BigVisionDatabase:
         return {"totals": totals, "protocols": out_list}
 
     # ------------- Relations CRUD -------------
-
     def add_relation(
         self,
         *,
@@ -1053,7 +1050,6 @@ class BigVisionDatabase:
         missing = [rid for rid in relation_ids if rid not in found_set]
         return (missing, found)
 
-    # New: 识别 ZIP 内部是否有顶层目录前缀（例如 CeFA_test.bvbundle/）
     @staticmethod
     def _detect_bundle_prefix(bundle_path: str) -> str:
         """
@@ -1064,7 +1060,6 @@ class BigVisionDatabase:
         import zipfile
 
         p = Path(bundle_path)
-        # 仅 zip 需要前缀探测；目录情况直接返回空前缀
         if not is_zip_path(p):
             return ""
 
@@ -1075,26 +1070,24 @@ class BigVisionDatabase:
         if any(n == "manifest.json" for n in names):
             return ""
 
-        # 情况2：寻找形如 ".../manifest.json" 的成员，取其目录作为前缀
+        # 情况2：寻找以 manifest.json 结尾的成员，取其目录作为前缀
         for n in names:
             if n.endswith("manifest.json"):
-                # 去掉文件名，保留 'dir/.../'
                 return n[: -len("manifest.json")]
 
-        # 情况3（兜底）：如果只有一个顶层目录，则将其作为前缀
+        # 情况3：只有一个顶层目录，兜底它
         tops = {n.split("/", 1)[0] for n in names if "/" in n}
         if len(tops) == 1:
             return list(tops)[0] + "/"
 
-        # 实在无法判断就返回空（后续照常尝试，若缺失会报错）
         return ""
 
         # ============ EXPORT: Bundle（完整备份，可回导） ============
 
     def export_protocol_bundle(
             self,
-            protocol_name: str | None,
-            out_path: str | None,
+            protocol_name: str,
+            out_path: str,
             *,
             copy_mode: str = "copy",  # 'copy' | 'hardlink' | 'symlink' | 'manifest-only'
             include_thumbnails: bool = False,
@@ -1102,87 +1095,12 @@ class BigVisionDatabase:
             zip_output: bool = True,
             overwrite: bool = False,
     ) -> Dict[str, Any]:
-        """
-        导出 protocol 为 Bundle；**已扩展支持**：
-          - protocol_name 为 None / "" / "*" / "all" / "__all__"：导出全部 protocol（默认行为）
-          - protocol_name 为 "a,b,c"（逗号分隔）：批量导出多个协议
-          - 仍兼容传入单个协议名的旧用法
-
-        out_path 语义：
-          - 多协议导出：out_path 被视为目录（若以 .zip 结尾，则使用其父目录）；为空则默认 <DB_ROOT>/bundles/
-          - 单协议导出：若 out_path 空，则默认 <DB_ROOT>/bundles/<protocol>.zip（或目录，取决于 zip_output）
-
-        返回：
-          - 多协议：{"ok", "exported", "failed", "results":[{protocol_name, ok, result|error}, ...]}
-          - 单协议：与旧版保持一致，为单个导出结果字典
-        """
+        import os
+        import time
+        import shutil
+        import json as _json
         from pathlib import Path
-
-        # ---- 参数合法性快速校验（多/单协议分支都适用） ----
-        if copy_mode not in ("copy", "hardlink", "symlink", "manifest-only"):
-            raise ValueError("copy_mode must be one of: copy|hardlink|symlink|manifest-only")
-        if color_order not in ("rgb", "bgr"):
-            raise ValueError("color_order must be 'rgb' | 'bgr'")
-
-        # ---- 解析协议列表 ----
-        protos: List[str]
-        token = (str(protocol_name).strip() if protocol_name is not None else "")
-        if (not token) or token in ("*", "all", "__all__"):
-            protos = [r["protocol_name"] for r in self.list_protocols()]
-        elif "," in token:
-            protos = [p.strip() for p in token.split(",") if p.strip()]
-        else:
-            protos = [token]
-
-        # 去重保序
-        protos = list(dict.fromkeys(protos))
-
-        # ---- 多协议导出：聚合并返回汇总 ----
-        if len(protos) > 1:
-            # 计算基目录：out_path 若是 *.zip -> 用其父目录；否则当作目录；为空则 <DB_ROOT>/bundles
-            if out_path:
-                p = Path(out_path)
-                base_dir = (p.parent if str(out_path).lower().endswith(".zip") else p)
-            else:
-                base_dir = Path(self.database_root) / "bundles"
-            base_dir.mkdir(parents=True, exist_ok=True)
-
-            results: List[Dict[str, Any]] = []
-            ok_cnt, err_cnt = 0, 0
-            for pname in protos:
-                per_out = base_dir / (f"{pname}.zip" if zip_output else pname)
-                try:
-                    # 调回本函数：此时为“单协议路径”，不会再次走多协议分支
-                    res = self.export_protocol_bundle(
-                        protocol_name=pname,
-                        out_path=str(per_out),
-                        copy_mode=copy_mode,
-                        include_thumbnails=include_thumbnails,
-                        color_order=color_order,
-                        zip_output=zip_output,
-                        overwrite=overwrite,
-                    )
-                    results.append({"protocol_name": pname, "ok": True, "result": res})
-                    ok_cnt += 1
-                except Exception as e:
-                    results.append({"protocol_name": pname, "ok": False, "error": str(e)})
-                    err_cnt += 1
-
-            return {"ok": err_cnt == 0, "exported": ok_cnt, "failed": err_cnt, "results": results}
-
-        # ---- 单协议导出（保持旧逻辑；仅增加 out_path 默认值） ----
-        protocol_name = protos[0] if protos else ""
-        if not protocol_name:
-            return {"ok": True, "exported": 0, "failed": 0, "results": []}  # 空库兜底
-
-        # 计算单协议默认 out_path
-        if not out_path or not str(out_path).strip():
-            bundles_dir = Path(self.database_root) / "bundles"
-            bundles_dir.mkdir(parents=True, exist_ok=True)
-            out_path_final = str(bundles_dir / (f"{protocol_name}.zip" if zip_output else protocol_name))
-        else:
-            out_path_final = str(out_path)
-
+        import numpy as _np
 
         # --- NEW: 进度条可用性 ---
         try:
@@ -1190,7 +1108,10 @@ class BigVisionDatabase:
         except Exception:
             tqdm = None  # type: ignore
 
-        root = _Path(self.database_root)
+        if copy_mode not in ("copy", "hardlink", "symlink", "manifest-only"):
+            raise ValueError("copy_mode must be one of: copy|hardlink|symlink|manifest-only")
+
+        root = Path(self.database_root)
         ts = time.strftime("%Y%m%d-%H%M%S")
         tmp_root = root / "tmp" / f"bundle_{protocol_name}_{ts}"
         tmp_root.mkdir(parents=True, exist_ok=True)
@@ -1274,7 +1195,7 @@ class BigVisionDatabase:
             with img_index.open("w", encoding="utf-8") as f:
                 for iid, meta in id_meta.items():
                     src = (root / meta["uri"]).resolve()
-                    rel_dst = _Path("images") / meta["dataset_name"] / f"{iid}.npy"
+                    rel_dst = Path("images") / meta["dataset_name"] / f"{iid}.npy"
                     abs_dst = (bundle_dir / rel_dst)
                     abs_dst.parent.mkdir(parents=True, exist_ok=True)
 
@@ -1300,6 +1221,7 @@ class BigVisionDatabase:
                     # 轻载 dtype/shape（即便拷贝失败也尽量记录）
                     dtype, shape = None, None
                     try:
+                        import numpy as _np
                         arr = _np.load(src, allow_pickle=False, mmap_mode="r")
                         dtype = str(arr.dtype)
                         shape = list(arr.shape)
@@ -1370,7 +1292,7 @@ class BigVisionDatabase:
         (bundle_dir / "README.md").write_text(render_readme_bundle(protocol_name), encoding="utf-8")
 
         # -------- 5) 打包/落盘 --------
-        return finalize_export_zip(bundle_dir, out_path_final, zip_output, overwrite)
+        return finalize_export_zip(bundle_dir, out_path, zip_output, overwrite)
 
     def verify_bundle(
             self,
@@ -1382,21 +1304,21 @@ class BigVisionDatabase:
     ) -> Dict[str, Any]:
 
         p = Path(bundle_path)
-        prefix = self._detect_bundle_prefix(bundle_path)  # <-- 新增
+        prefix = self._detect_bundle_prefix(bundle_path)
 
         # 1) 结构文件
         required = ["manifest.json", "protocol.json", "relations.jsonl", "images_index.jsonl"]
         for name in required:
-            if not bundle_member_exists(p, prefix + name):  # <-- 加前缀
+            if not bundle_member_exists(p, prefix + name):
                 msg = f"missing required file: {name}"
                 if strict: raise RuntimeError(msg)
                 return {"ok": False, "error": msg}
 
         # 2) 校验 checksums
-        manifest = bundle_read_json(p, prefix + "manifest.json")  # <-- 加前缀
+        manifest = bundle_read_json(p, prefix + "manifest.json")
         checksums = (manifest.get("checksums") or {}) if isinstance(manifest, dict) else {}
         if check_sha256 and checksums:
-            # zip 的逐成员哈希这里保持原逻辑：仅目录走逐文件校验
+            # 只能对目录情形直接读文件哈希；ZIP 的哈希已随包固定（可跳过或扩展：计算 zip 成员哈希）
             if not is_zip_path(p):
                 for name, val in checksums.items():
                     alg, hexd = val.split(":", 1)
@@ -1412,11 +1334,11 @@ class BigVisionDatabase:
 
         # 3) index 覆盖 relations 引用
         idx_map: Dict[str, str] = {}
-        for o in bundle_iter_jsonl(p, prefix + "images_index.jsonl"):  # <-- 加前缀
+        for o in bundle_iter_jsonl(p, prefix + "images_index.jsonl"):
             if "image_id" in o and "rel_path" in o:
                 idx_map[str(o["image_id"])] = str(o["rel_path"])
         miss_img_ids = []
-        for o in bundle_iter_jsonl(p, prefix + "relations.jsonl"):  # <-- 加前缀
+        for o in bundle_iter_jsonl(p, prefix + "relations.jsonl"):
             payload = o.get("payload") or {}
             for iid in (payload.get("image_ids") or []):
                 if str(iid) not in idx_map:
@@ -1430,7 +1352,7 @@ class BigVisionDatabase:
             if strict: raise RuntimeError(msg)
             return {"ok": False, "error": msg}
 
-        # 4) 目录模式下做文件存在性检查（zip 保持原样）
+        # 4) 文件存在性（对目录或 zip 解压后的逐文件检查，这里对 zip 仅检查元信息是否存在即可）
         missing_files = []
         if not is_zip_path(p):
             for iid, relp in list(idx_map.items())[: max(10000, sample_limit)]:
@@ -1444,18 +1366,32 @@ class BigVisionDatabase:
             "index_size": len(idx_map),
         }
 
+        # ============ IMPORT: Bundle（加载回 DB） ============
+
     def load_bundle(
         self,
         bundle_path: str,
         *,
-        mode: str = "strict",
-        copy_mode: str = "copy",
+        mode: str = "strict",           # 'strict' | 'overwrite' | 'skip-existing'
+        copy_mode: str = "copy",        # 'copy'|'hardlink'|'symlink'（ZIP 会自动退化为 copy）
         verify: bool = True,
         verify_checksums: bool = True,
         batch_size: int = 2000,
         verbose: bool = True,
     ) -> Dict[str, Any]:
+        """
+        将 Bundle（目录或 .zip）加载回 DB：
+          - 逐文件拷贝/链接图片到 <db_root>/images/<dataset>/<image_id>.npy（ZIP 按需流式复制，不整包解压）
+          - 批量插入/更新 images、relations、protocol 三表
 
+        mode:
+          - strict       : 任意 image_id / relation_id 冲突都会报错并中止
+          - overwrite    : 覆盖 DB 内容（images/relations/protocol），文件会被替换
+          - skip-existing: 已存在的行/文件跳过，仅插入缺失项
+
+        batch_size: 分批插入大小（越大越快、占用内存越高）
+        verbose   : 显示进度（需要安装 tqdm；若缺失则自动安静模式）
+        """
         import json
         from pathlib import Path
 
@@ -1471,17 +1407,16 @@ class BigVisionDatabase:
             tqdm = None
             verbose = False
 
-        # 新增：探测 zip 顶层前缀
-        prefix = self._detect_bundle_prefix(bundle_path)   # <-- 新增
+        prefix = self._detect_bundle_prefix(bundle_path)
 
-        # 0) 验证（用支持前缀的 verify_bundle）
+        # 0) 验证
         if verify:
             ver = self.verify_bundle(bundle_path, strict=True, check_sha256=verify_checksums)
             if not ver.get("ok", True):
                 raise RuntimeError(f"verify_bundle failed: {ver}")
 
         # 1) protocol
-        proto = bundle_read_json(bundle_path, prefix + "protocol.json")  # <-- 加前缀
+        proto = bundle_read_json(bundle_path, prefix + "protocol.json")
         protocol_name = str(proto.get("protocol_name", "unknown"))
 
         root = Path(self.database_root)
@@ -1489,10 +1424,10 @@ class BigVisionDatabase:
         relations_processed = 0
         proto_links = 0
 
-        # -------- 统计条目数（用于进度条 total） --------
+        # -------- 统计条目数（仅用于进度条 total） --------
         def _count_jsonl(member: str) -> int:
             c = 0
-            for _ in bundle_iter_jsonl(bundle_path, prefix + member):  # <-- 加前缀
+            for _ in bundle_iter_jsonl(bundle_path, prefix + member):
                 c += 1
             return c
 
@@ -1507,9 +1442,41 @@ class BigVisionDatabase:
         img_batch_ids: List[str] = []
 
         def _flush_images_batch():
-            ...
+            nonlocal images_processed
+            if not img_batch_rows:
+                return
+            # 冲突检查
+            placeholders = ",".join(["?"] * len(img_batch_ids))
+            existing_ids = set(r[0] for r in self.conn.execute(
+                f"SELECT image_id FROM images WHERE image_id IN ({placeholders})",
+                img_batch_ids,
+            ).fetchall())
+            if mode == "strict" and existing_ids:
+                raise RuntimeError(f"[images] strict conflict: sample={list(existing_ids)[:10]}")
+
+            to_insert = [r for r in img_batch_rows if r["image_id"] not in existing_ids or mode == "overwrite"]
+            if to_insert:
+                import pandas as pd
+                df = pd.DataFrame(to_insert, columns=["image_id", "uri", "modality", "dataset_name", "alias", "extra"])
+                self.conn.execute("BEGIN;")
+                try:
+                    if mode == "overwrite" and existing_ids:
+                        del_ids = [r["image_id"] for r in to_insert if r["image_id"] in existing_ids]
+                        if del_ids:
+                            ph = ",".join(["?"] * len(del_ids))
+                            self.conn.execute(f"DELETE FROM images WHERE image_id IN ({ph})", del_ids)
+                    self.conn.register("img_df_tmp_import", df)
+                    self.conn.execute("INSERT INTO images SELECT * FROM img_df_tmp_import;")
+                    self.conn.execute("COMMIT;")
+                except Exception:
+                    self.conn.execute("ROLLBACK;")
+                    raise
+            images_processed += len(img_batch_rows)
+            img_batch_rows.clear()
+            img_batch_ids.clear()
+
         # 实际逐条处理（复制文件 + 构建行）
-        for idx, o in enumerate(bundle_iter_jsonl(bundle_path, prefix + "images_index.jsonl")):  # <-- 加前缀
+        for idx, o in enumerate(bundle_iter_jsonl(bundle_path, prefix + "images_index.jsonl")):
             if not o or "image_id" not in o or "rel_path" not in o:
                 if pbar_imgs: pbar_imgs.update(1)
                 continue
@@ -1524,9 +1491,8 @@ class BigVisionDatabase:
             dst_rel = Path("images") / ds / f"{iid}.npy"
             dst_abs = (root / dst_rel)
             if mode in ("overwrite", "strict") or not dst_abs.exists():
-                # 注意：zip 中的实际成员要加前缀
-                bundle_copy_or_link_member(bundle_path, prefix + relp, dst_abs,  # <-- 这里加前缀
-                                           mode=copy_mode, overwrite=(mode != "strict"))
+                # zip 会在 bundle_copy_or_link_member 内部自动退化为 copy
+                bundle_copy_or_link_member(bundle_path, prefix + relp, dst_abs, mode=copy_mode, overwrite=(mode != "strict"))
 
             img_batch_rows.append({
                 "image_id": iid,
@@ -1552,8 +1518,73 @@ class BigVisionDatabase:
         rel_batch_ids: List[str] = []
 
         def _flush_rel_batch():
-            ...
-        for idx, o in enumerate(bundle_iter_jsonl(bundle_path, prefix + "relations.jsonl")):  # <-- 加前缀
+            nonlocal relations_processed, proto_links
+            if not rel_batch_rows:
+                return
+            placeholders = ",".join(["?"] * len(rel_batch_ids))
+            existing_rids = set(r[0] for r in self.conn.execute(
+                f"SELECT relation_id FROM relations WHERE relation_id IN ({placeholders})",
+                rel_batch_ids,
+            ).fetchall())
+            if mode == "strict" and existing_rids:
+                raise RuntimeError(f"[relations] strict conflict: sample={list(existing_rids)[:10]}")
+
+            to_insert = [r for r in rel_batch_rows if r["relation_id"] not in existing_rids or mode == "overwrite"]
+            if to_insert:
+                import pandas as pd
+                df = pd.DataFrame(to_insert, columns=["relation_id", "payload"])
+                self.conn.execute("BEGIN;")
+                try:
+                    if mode == "overwrite" and existing_rids:
+                        del_ids = [r["relation_id"] for r in to_insert if r["relation_id"] in existing_rids]
+                        if del_ids:
+                            ph = ",".join(["?"] * len(del_ids))
+                            self.conn.execute(f"DELETE FROM relations WHERE relation_id IN ({ph})", del_ids)
+                    self.conn.register("rel_df_tmp_import", df)
+                    self.conn.execute("INSERT INTO relations SELECT * FROM rel_df_tmp_import;")
+                    self.conn.execute("COMMIT;")
+                except Exception:
+                    self.conn.execute("ROLLBACK;")
+                    raise
+
+            # protocol 映射（本批）
+            if rel_batch_ids:
+                ph = ",".join(["?"] * len(rel_batch_ids))
+                exists_map = set(r[0] for r in self.conn.execute(
+                    f"SELECT relation_id FROM protocol WHERE protocol_name = ? AND relation_id IN ({ph})",
+                    [protocol_name, *rel_batch_ids],
+                ).fetchall())
+                if mode == "strict" and exists_map:
+                    raise RuntimeError(f"[protocol] strict mapping conflict: sample={list(exists_map)[:10]}")
+                to_link = [rid for rid in rel_batch_ids if rid not in exists_map or mode == "overwrite"]
+
+                if to_link:
+                    rows = [(protocol_name, rid, protocol_name) for rid in to_link]
+                    import pandas as pd
+                    df_map = pd.DataFrame(rows, columns=["protocol_name", "relation_id", "relation_set"])
+                    self.conn.execute("BEGIN;")
+                    try:
+                        if mode == "overwrite" and exists_map:
+                            del_ids = [rid for rid in to_link if rid in exists_map]
+                            if del_ids:
+                                ph2 = ",".join(["?"] * len(del_ids))
+                                self.conn.execute(
+                                    f"DELETE FROM protocol WHERE protocol_name = ? AND relation_id IN ({ph2})",
+                                    [protocol_name, *del_ids],
+                                )
+                        self.conn.register("proto_df_tmp_import", df_map)
+                        self.conn.execute("INSERT INTO protocol SELECT * FROM proto_df_tmp_import;")
+                        self.conn.execute("COMMIT;")
+                    except Exception:
+                        self.conn.execute("ROLLBACK;")
+                        raise
+                    proto_links += len(to_link)
+
+            relations_processed += len(rel_batch_rows)
+            rel_batch_rows.clear()
+            rel_batch_ids.clear()
+
+        for idx, o in enumerate(bundle_iter_jsonl(bundle_path, prefix + "relations.jsonl")):
             if not o or "relation_id" not in o or "payload" not in o:
                 if pbar_rels: pbar_rels.update(1)
                 continue
@@ -1570,6 +1601,35 @@ class BigVisionDatabase:
 
         _flush_rel_batch()
         if pbar_rels: pbar_rels.close()
+
+        # ---- 兜底：根据 protocol.json 全量补齐 protocol 映射 ----
+        try:
+            proto_meta = bundle_read_json(bundle_path, prefix + "protocol.json")
+            pname = str(proto_meta.get("protocol_name", protocol_name))
+            ids_from_proto = set(map(str, proto_meta.get("relation_ids", [])))
+            if ids_from_proto:
+                existing = {
+                    r[0] for r in self.conn.execute(
+                        "SELECT relation_id FROM protocol WHERE protocol_name = ?",
+                        [pname],
+                    ).fetchall()
+                }
+                to_link = sorted(ids_from_proto - existing)
+                if to_link:
+                    rows = [(pname, rid, pname) for rid in to_link]
+                    df_map = pd.DataFrame(rows, columns=["protocol_name", "relation_id", "relation_set"])
+                    self.conn.execute("BEGIN;")
+                    try:
+                        self.conn.register("proto_df_tmp_import2", df_map)
+                        self.conn.execute("INSERT INTO protocol SELECT * FROM proto_df_tmp_import2;")
+                        self.conn.execute("COMMIT;")
+                    except Exception:
+                        self.conn.execute("ROLLBACK;")
+                        raise
+                    proto_links += len(to_link)
+        except Exception:
+            # 兜底失败不影响已导入的数据
+            pass
 
         if verbose:
             print(f"[LOAD] images={images_processed}, relations={relations_processed}, protocol_links={proto_links}, mode={mode}, copy_mode={copy_mode}{' (zip->copy)' if is_zip_path(bundle_path) else ''}")
@@ -1598,7 +1658,7 @@ class BigVisionDatabase:
         - 当 out_path 为 None 时，自动输出到 <database_root>/tmp/compact/<protocol>_compact_<ts>.zip（zip_output=True）
           或者 <database_root>/tmp/compact/<protocol>_compact_<ts>/ 目录（zip_output=False）。
         """
-        import time, json as _json, shutil, random
+        import os, time, json as _json, shutil, random
         from pathlib import Path
         import pandas as pd
         from Database.utils import sha256_file, finalize_export_zip, render_readme_compact  # <<< 用utils里的函数
@@ -1763,9 +1823,9 @@ class BigVisionDatabase:
 
         # --- manifest（包含每个分片校验和） ---
         checksums = {}
-        for p in sorted(samples_out.glob("samples-*.parquet")):
-            rel = p.relative_to(export_dir).as_posix()
-            checksums[rel] = f"sha256:{sha256_file(p)}"
+        for pth in sorted(samples_out.glob("samples-*.parquet")):
+            rel = pth.relative_to(export_dir).as_posix()
+            checksums[rel] = f"sha256:{sha256_file(pth)}"
         manifest = {
             "schema": "compact.v1",
             "protocol_name": protocol_name,
@@ -1839,42 +1899,6 @@ if __name__ == "__main__":
             print(f"[INFO] sampled {len(sample_ids)} image_ids")
         else:
             print("[INFO] No images found in DB; skip export test.")
-
-        # ------- Relations CRUD（dry_run） -------
-        # if sample_ids:
-        #     new_payload = {
-        #         "task_type": "demo",
-        #         "annotation": {"note": "dry-run create test"},
-        #         "image_ids": sample_ids[: min(3, len(sample_ids))],
-        #     }
-        #     print("\n[TEST] add_relation (dry_run)")
-        #     print(json.dumps(db.add_relation(payload=new_payload, protocols=["demo_proto", "debug_view"], dry_run=True),
-        #                      ensure_ascii=False, indent=2))
-        #
-        # exist_row = db.conn.execute("SELECT relation_id FROM relations LIMIT 1").fetchone()
-        # if exist_row:
-        #     exist_rid = exist_row[0]
-        #     print("\n[TEST] get_relation")
-        #     print(json.dumps(db.get_relation(exist_rid), ensure_ascii=False, indent=2))
-        #
-        #     print("\n[TEST] update_relation (dry_run)")
-        #     upd_payload = {
-        #         "task_type": "updated_demo",
-        #         "annotation": {"note": "dry-run update"},
-        #         "image_ids": sample_ids[: min(2, len(sample_ids))] if sample_ids else [],
-        #     }
-        #     print(json.dumps(db.update_relation(
-        #         exist_rid,
-        #         payload=upd_payload,
-        #         add_protocols=["extra_proto"],
-        #         remove_protocols=["debug_view"],
-        #         dry_run=True,
-        #     ), ensure_ascii=False, indent=2))
-        #
-        #     print("\n[TEST] delete_relation (dry_run)")
-        #     print(json.dumps(db.delete_relation(exist_rid, dry_run=True), ensure_ascii=False, indent=2))
-        # else:
-        #     print("[INFO] No existing relations to test update/delete.")
 
         # ------- Protocols CRUD/组织/采样（全部 dry_run） -------
         print("\n[TEST] list_protocols()")
